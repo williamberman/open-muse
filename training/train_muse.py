@@ -29,7 +29,7 @@ import wandb
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedType, set_seed
-from data import ClassificationDataset, Text2ImageDataset
+from data import ClassificationDataset, Text2ImageDataset, Text2ImagePreEncodedDataset
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from optimizer import Lion
 from PIL import Image
@@ -231,25 +231,32 @@ def main():
     #########################
     logger.info("Loading models and optimizer")
 
-    if config.model.text_encoder.type == "clip":
-        text_encoder = CLIPTextModel.from_pretrained(config.model.text_encoder.pretrained)
-        tokenizer = CLIPTokenizer.from_pretrained(config.model.text_encoder.pretrained)
-    elif config.model.text_encoder.type == "t5":
-        text_encoder = T5EncoderModel.from_pretrained(config.model.text_encoder.pretrained)
-        tokenizer = T5Tokenizer.from_pretrained(config.model.text_encoder.pretrained)
-    else:
-        raise ValueError(f"Unknown text model type: {config.model.text_encoder.type}")
+    if not config.model.pre_encoded:
+        if config.model.text_encoder.type == "clip":
+            text_encoder = CLIPTextModel.from_pretrained(config.model.text_encoder.pretrained)
+            tokenizer = CLIPTokenizer.from_pretrained(config.model.text_encoder.pretrained)
+        elif config.model.text_encoder.type == "t5":
+            text_encoder = T5EncoderModel.from_pretrained(config.model.text_encoder.pretrained)
+            tokenizer = T5Tokenizer.from_pretrained(config.model.text_encoder.pretrained)
+        else:
+            raise ValueError(f"Unknown text model type: {config.model.text_encoder.type}")
 
-    vq_class = get_vq_model_class(config.model.vq_model.type)
-    vq_model = vq_class.from_pretrained(config.model.vq_model.pretrained)
+        vq_class = get_vq_model_class(config.model.vq_model.type)
+        vq_model = vq_class.from_pretrained(config.model.vq_model.pretrained)
+    else:
+        text_encoder = None
+        tokenizer = None
+        vq_model = None
 
     model_cls = MaskGitTransformer if config.model.get("architecture", "transformer") == "transformer" else MaskGiTUViT
     model = model_cls(**config.model.transformer)
     mask_id = model.config.mask_token_id
 
     # Freeze the text model and VQGAN
-    text_encoder.requires_grad_(False)
-    vq_model.requires_grad_(False)
+    if text_encoder is not None:
+        text_encoder.requires_grad_(False)
+    if vq_model is not None:
+        vq_model.requires_grad_(False)
 
     # Create EMA
     if config.training.get("use_ema", False):
@@ -348,31 +355,46 @@ def main():
     preproc_config = config.dataset.preprocessing
     dataset_config = config.dataset.params
 
-    if config.dataset.type == "classification":
-        dataset_cls = partial(
-            ClassificationDataset,
-            return_text=True,
-            imagenet_class_mapping_path=dataset_config.imagenet_class_mapping_path,
+    if not config.model.pre_encoded:
+        if config.dataset.type == "classification":
+            dataset_cls = partial(
+                ClassificationDataset,
+                return_text=True,
+                imagenet_class_mapping_path=dataset_config.imagenet_class_mapping_path,
+            )
+        else:
+            dataset_cls = Text2ImageDataset
+
+        dataset = dataset_cls(
+            train_shards_path_or_url=dataset_config.train_shards_path_or_url,
+            eval_shards_path_or_url=dataset_config.eval_shards_path_or_url,
+            tokenizer=tokenizer,
+            max_seq_length=preproc_config.max_seq_length,
+            num_train_examples=config.experiment.max_train_examples,
+            per_gpu_batch_size=config.training.batch_size,
+            global_batch_size=total_batch_size_without_accum,
+            num_workers=dataset_config.num_workers,
+            resolution=preproc_config.resolution,
+            center_crop=preproc_config.center_crop,
+            random_flip=preproc_config.random_flip,
+            shuffle_buffer_size=dataset_config.shuffle_buffer_size,
+            pin_memory=dataset_config.pin_memory,
+            persistent_workers=dataset_config.persistent_workers,
         )
     else:
-        dataset_cls = Text2ImageDataset
-
-    dataset = dataset_cls(
-        train_shards_path_or_url=dataset_config.train_shards_path_or_url,
-        eval_shards_path_or_url=dataset_config.eval_shards_path_or_url,
-        tokenizer=tokenizer,
-        max_seq_length=preproc_config.max_seq_length,
-        num_train_examples=config.experiment.max_train_examples,
-        per_gpu_batch_size=config.training.batch_size,
-        global_batch_size=total_batch_size_without_accum,
-        num_workers=dataset_config.num_workers,
-        resolution=preproc_config.resolution,
-        center_crop=preproc_config.center_crop,
-        random_flip=preproc_config.random_flip,
-        shuffle_buffer_size=dataset_config.shuffle_buffer_size,
-        pin_memory=dataset_config.pin_memory,
-        persistent_workers=dataset_config.persistent_workers,
-    )
+        dataset = Text2ImagePreEncodedDataset(
+            train_shards_path_or_url=dataset_config.train_shards_path_or_url,
+            eval_shards_path_or_url=dataset_config.eval_shards_path_or_url,
+            vae_checkpoint=config.model.vq_model.pretrained,
+            text_encoder_checkpoint=config.model.text_encoder.pretrained,
+            num_train_examples=config.experiment.max_train_examples,
+            per_gpu_batch_size=config.training.batch_size,
+            global_batch_size=total_batch_size_without_accum,
+            num_workers=dataset_config.num_workers,
+            shuffle_buffer_size=dataset_config.shuffle_buffer_size,
+            pin_memory=dataset_config.pin_memory,
+            persistent_workers=dataset_config.persistent_workers,
+        )
     train_dataloader, eval_dataloader = dataset.train_dataloader, dataset.eval_dataloader
 
     lr_scheduler = get_scheduler(
@@ -396,8 +418,10 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    text_encoder.to(device=accelerator.device, dtype=weight_dtype)
-    vq_model.to(device=accelerator.device)
+    if text_encoder is not None:
+        text_encoder.to(device=accelerator.device, dtype=weight_dtype)
+    if vq_model is not None:
+        vq_model.to(device=accelerator.device)
     if config.training.get("use_ema", False):
         ema.to(accelerator.device)
 
@@ -466,6 +490,12 @@ def main():
 
         encoder_hidden_states = text_encoder(input_ids)[0]
 
+        input_ids, labels, mask_prob = prepare_input_ids_and_labels(image_tokens, min_masking_rate)
+
+        return input_ids, encoder_hidden_states, labels, soft_targets, mask_prob
+
+    @torch.no_grad()
+    def prepare_input_ids_and_labels(image_tokens, min_masking_rate: float = 0.0):
         batch_size, seq_len = image_tokens.shape
         # TODO(Patrick) - I don't think that's how the timesteps are sampled in maskgit or MUSE
         # Sample a random timestep for each image
@@ -482,7 +512,7 @@ def main():
         input_ids = torch.where(mask, mask_id, image_tokens)
         labels = torch.where(mask, image_tokens, -100)
 
-        return input_ids, encoder_hidden_states, labels, soft_targets, mask_prob
+        return input_ids, labels, mask_prob
 
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
@@ -492,16 +522,26 @@ def main():
     for epoch in range(first_epoch, num_train_epochs):
         model.train()
         for batch in train_dataloader:
-            # TODO(Patrick) - We could definitely pre-compute the image tokens for faster training on larger datasets
-            pixel_values, input_ids = batch
-            pixel_values = pixel_values.to(accelerator.device, non_blocking=True)
-            input_ids = input_ids.to(accelerator.device, non_blocking=True)
-            data_time_m.update(time.time() - end)
+            if not config.model.pre_encoded:
+                pixel_values, input_ids = batch
+                pixel_values = pixel_values.to(accelerator.device, non_blocking=True)
+                input_ids = input_ids.to(accelerator.device, non_blocking=True)
+                data_time_m.update(time.time() - end)
 
-            # encode images to image tokens, mask them and create input and labels
-            input_ids, encoder_hidden_states, labels, soft_targets, mask_prob = prepare_inputs_and_labels(
-                pixel_values, input_ids, config.training.min_masking_rate
-            )
+                # encode images to image tokens, mask them and create input and labels
+                input_ids, encoder_hidden_states, labels, soft_targets, mask_prob = prepare_inputs_and_labels(
+                    pixel_values, input_ids, config.training.min_masking_rate
+                )
+            else:
+                image_tokens, encoder_hidden_states = batch
+                image_tokens = image_tokens.to(accelerator.device, non_blocking=True)
+                encoder_hidden_states = encoder_hidden_states.to(accelerator.device, non_blocking=True)
+                data_time_m.update(time.time() - end)
+
+                input_ids, labels, mask_prob = prepare_input_ids_and_labels(
+                    image_tokens, config.training.min_masking_rate
+                )
+                soft_targets = None  # not supported for pre-encoding right now
 
             # log the inputs for the first step of the first epoch
             if global_step == 0 and epoch == 0:

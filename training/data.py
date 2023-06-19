@@ -338,3 +338,89 @@ class Text2ImageDataset:
     @property
     def eval_dataloader(self):
         return self._eval_dataloader
+
+
+class Text2ImagePreEncodedDataset:
+    def __init__(
+        self,
+        train_shards_path_or_url: Union[str, List[str]],
+        eval_shards_path_or_url: Union[str, List[str]],
+        vae_checkpoint: str,
+        text_encoder_checkpoint: str,
+        num_train_examples: int,
+        per_gpu_batch_size: int,
+        global_batch_size: int,
+        num_workers: int,
+        shuffle_buffer_size: int = 1000,
+        pin_memory: bool = False,
+        persistent_workers: bool = False,
+    ):
+        if not isinstance(train_shards_path_or_url, str):
+            train_shards_path_or_url = [list(braceexpand(urls)) for urls in train_shards_path_or_url]
+            # flatten list using itertools
+            train_shards_path_or_url = list(itertools.chain.from_iterable(train_shards_path_or_url))
+
+        if not isinstance(eval_shards_path_or_url, str):
+            eval_shards_path_or_url = [list(braceexpand(urls)) for urls in eval_shards_path_or_url]
+            # flatten list using itertools
+            eval_shards_path_or_url = list(itertools.chain.from_iterable(eval_shards_path_or_url))
+
+        # Create train dataset and loader
+        pipeline = [
+            wds.ResampledShards(train_shards_path_or_url),
+            tarfile_to_samples_nothrow,
+            wds.shuffle(shuffle_buffer_size),
+            wds.decode(wds.handle_extension("pth", wds.autodecode.torch_loads)),
+            wds.rename(input_ids=f"{vae_checkpoint}.pth", encoder_hidden_states=f"{text_encoder_checkpoint}.pth"),
+            wds.map(filter_keys(set(["input_ids", "encoder_hidden_states"]))),
+            wds.to_tuple("input_ids", "encoder_hidden_states"),
+            wds.batched(per_gpu_batch_size, partial=False, collation_fn=default_collate),
+        ]
+
+        num_batches = math.ceil(num_train_examples / global_batch_size)
+        num_worker_batches = math.ceil(num_train_examples / (global_batch_size * num_workers))  # per dataloader worker
+        num_batches = num_worker_batches * num_workers
+        num_samples = num_batches * global_batch_size
+
+        # each worker is iterating over this
+        self._train_dataset = wds.DataPipeline(*pipeline).with_epoch(num_worker_batches)
+        self._train_dataloader = wds.WebLoader(
+            self._train_dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+        # add meta-data to dataloader instance for convenience
+        self._train_dataloader.num_batches = num_batches
+        self._train_dataloader.num_samples = num_samples
+
+        # Create eval dataset and loader
+        pipeline = [
+            wds.SimpleShardList(eval_shards_path_or_url),
+            wds.split_by_worker,
+            wds.tarfile_to_samples(handler=wds.ignore_and_continue),
+            wds.decode(wds.handle_extension("pth", wds.autodecode.torch_loads)),
+            wds.rename(input_ids=f"{vae_checkpoint}.pth", encoder_hidden_states=f"{text_encoder_checkpoint}.pth"),
+            wds.map(filter_keys(set(["input_ids", "encoder_hidden_states"]))),
+            wds.to_tuple("input_ids", "encoder_hidden_states"),
+            wds.batched(per_gpu_batch_size, partial=False, collation_fn=default_collate),
+        ]
+        self._eval_dataset = wds.DataPipeline(*pipeline)
+        self._eval_dataloader = wds.WebLoader(
+            self._eval_dataset,
+            batch_size=None,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+        )
+
+    @property
+    def train_dataloader(self):
+        return self._train_dataloader
+
+    @property
+    def eval_dataloader(self):
+        return self._eval_dataloader
