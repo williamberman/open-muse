@@ -188,15 +188,15 @@ def main():
     vae_f8 = PaellaVQModel.from_pretrained(PAELLA_F8_VQVAE)
     vae_f8.to("cuda")
     vae_f8.requires_grad_(False)
-    vae_f8 = torch.compile(vae_f8, mode="reduce-overhead")  # inputs are cropped to fixed size, so will not re-compile
-    vae_f8(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
+    # inputs are cropped to fixed size, so will not re-compile
+    vae_f8.get_code = torch.compile(vae_f8.get_code, mode="reduce-overhead")
+    vae_f8.get_code(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
 
     vae_f16 = VQGANModel.from_pretrained(VQGAN_F16_VQVAE)
     vae_f16.to("cuda")
     vae_f16.requires_grad_(False)
-    vae_f16 = torch.compile(vae_f16, mode="reduce-overhead")
-    # TODO - throws illegal access error
-    # vae_f16(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
+    vae_f16.get_code = torch.compile(vae_f16.get_code, mode="reduce-overhead")
+    vae_f16.get_code(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
 
     tokenizer = CLIPTokenizer.from_pretrained(CLIP)
     text_encoder = CLIPTextModel.from_pretrained(CLIP)
