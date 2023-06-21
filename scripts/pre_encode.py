@@ -25,6 +25,7 @@ import torch
 from torchvision import transforms
 import time
 import torch
+from multiprocessing import Process, Queue
 
 from muse import (
     PaellaVQModel,
@@ -76,6 +77,12 @@ class TimingWrapper:
             self.timing += time.perf_counter() - t0
 
             yield next_
+
+
+def upload_process_body(fileobj, upload_queue):
+    with wds.TarWriter(fileobj) as dst:
+        sample = upload_queue.get(block=True)
+        dst.write(sample)
 
 
 def main():
@@ -218,64 +225,75 @@ def main():
 
         upload_shard_url = f"{upload_to}/{shard}.tar"
         logger.warning(f"Uploading shard {upload_shard_url}")
-        with wds.TarWriter(f"pipe:aws s3 cp - {upload_shard_url}") as dst:
-            for __key__, image, input_ids in src:
-                batch_ctr += 1
-                img_ctr += len(__key__)
-                logger.warning(f"Encoding examples {__key__}")
+        upload_queue = Queue()
+        upload_process = Process(
+            target=upload_process_body,
+            args=(
+                f"pipe:aws s3 cp - {upload_shard_url}",
+                upload_queue,
+            ),
+        )
+        upload_process.start()
+        for __key__, image, input_ids in src:
+            batch_ctr += 1
+            img_ctr += len(__key__)
+            logger.warning(f"Encoding examples {__key__}")
 
-                t0 = time.perf_counter()
-                image = image.to("cuda")
-                input_ids = input_ids.to("cuda")
-                time_to_cuda += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            image = image.to("cuda")
+            input_ids = input_ids.to("cuda")
+            time_to_cuda += time.perf_counter() - t0
 
-                t0 = time.perf_counter()
-                encoded_image_f8 = vae_f8.get_code(image)
-                if args.debug:
-                    torch.cuda.synchronize()
-                time_encoding_f8 += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            encoded_image_f8 = vae_f8.get_code(image)
+            if args.debug:
+                torch.cuda.synchronize()
+            time_encoding_f8 += time.perf_counter() - t0
 
-                t0 = time.perf_counter()
-                encoded_image_f16 = vae_f16.get_code(image)
-                if args.debug:
-                    torch.cuda.synchronize()
-                time_encoding_f16 += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            encoded_image_f16 = vae_f16.get_code(image)
+            if args.debug:
+                torch.cuda.synchronize()
+            time_encoding_f16 += time.perf_counter() - t0
 
-                t0 = time.perf_counter()
-                encoder_hidden_states = text_encoder(input_ids)[0]
-                if args.debug:
-                    torch.cuda.synchronize()
-                time_encoding_text_encoder += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            encoder_hidden_states = text_encoder(input_ids)[0]
+            if args.debug:
+                torch.cuda.synchronize()
+            time_encoding_text_encoder += time.perf_counter() - t0
 
-                t0 = time.perf_counter()
-                encoded_image_f8 = encoded_image_f8.to("cpu")
-                encoded_image_f16 = encoded_image_f16.to("cpu")
-                encoder_hidden_states = encoder_hidden_states.to("cpu")
-                time_to_cpu += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            encoded_image_f8 = encoded_image_f8.to("cpu")
+            encoded_image_f16 = encoded_image_f16.to("cpu")
+            encoder_hidden_states = encoder_hidden_states.to("cpu")
+            time_to_cpu += time.perf_counter() - t0
 
-                # when saving a view of a tensor, pytorch will save the entirety of the original tensor.
-                # cloning the view, will save just the subset of the original tensor.
-                t0 = time.perf_counter()
-                encoded_image_f8 = [x.clone() for x in torch.unbind(encoded_image_f8)]
-                encoded_image_f16 = [x.clone() for x in torch.unbind(encoded_image_f16)]
-                encoder_hidden_states = [x.clone() for x in torch.unbind(encoder_hidden_states)]
-                time_postprocess += time.perf_counter() - t0
+            # when saving a view of a tensor, pytorch will save the entirety of the original tensor.
+            # cloning the view, will save just the subset of the original tensor.
+            t0 = time.perf_counter()
+            encoded_image_f8 = [x.clone() for x in torch.unbind(encoded_image_f8)]
+            encoded_image_f16 = [x.clone() for x in torch.unbind(encoded_image_f16)]
+            encoder_hidden_states = [x.clone() for x in torch.unbind(encoder_hidden_states)]
+            time_postprocess += time.perf_counter() - t0
 
-                logger.warning("Writing examples")
+            logger.warning("Writing examples")
 
-                t0 = time.perf_counter()
-                for __key__, encoded_image_f8, encoded_image_f16, encoder_hidden_states in zip(
-                    __key__, encoded_image_f8, encoded_image_f16, encoder_hidden_states
-                ):
-                    sample = {
-                        "__key__": __key__,
-                        f"{'.'.join(PAELLA_F8_VQVAE.split('/'))}.pth": encoded_image_f8,
-                        f"{'.'.join(VQGAN_F16_VQVAE.split('/'))}.pth": encoded_image_f16,
-                        f"{'.'.join(CLIP.split('/'))}.pth": encoder_hidden_states,
-                    }
+            t0 = time.perf_counter()
+            for __key__, encoded_image_f8, encoded_image_f16, encoder_hidden_states in zip(
+                __key__, encoded_image_f8, encoded_image_f16, encoder_hidden_states
+            ):
+                sample = {
+                    "__key__": __key__,
+                    f"{'.'.join(PAELLA_F8_VQVAE.split('/'))}.pth": encoded_image_f8,
+                    f"{'.'.join(VQGAN_F16_VQVAE.split('/'))}.pth": encoded_image_f16,
+                    f"{'.'.join(CLIP.split('/'))}.pth": encoder_hidden_states,
+                }
 
-                    dst.write(sample)
-                time_write += time.perf_counter() - t0
+                upload_queue.put(sample, block=False)
+            time_write += time.perf_counter() - t0
+
+        upload_queue.close()
+        upload_process.join()
 
         logger.warning("************")
         logger.warning(f"num batches: {batch_ctr}")
