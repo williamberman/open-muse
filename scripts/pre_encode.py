@@ -80,9 +80,19 @@ class TimingWrapper:
 
 
 def upload_process_body(fileobj, upload_queue):
+    logger.warning(f"upload process: starting {fileobj}")
+
     with wds.TarWriter(fileobj) as dst:
-        sample = upload_queue.get(block=True)
-        dst.write(sample)
+        while True:
+            sample = upload_queue.get(block=True)
+
+            if sample is None:
+                break
+
+            dst.write(sample)
+
+    upload_queue.close()
+    logger.warning(f"upload process: finishing {fileobj}")
 
 
 def main():
@@ -213,6 +223,19 @@ def main():
         src = wds.WebLoader(src, batch_size=None, shuffle=False, num_workers=1, pin_memory=True)
         src = TimingWrapper(src)
 
+        upload_shard_url = f"{upload_to}/{shard}.tar"
+        logger.warning(f"Uploading shard {upload_shard_url}")
+
+        upload_queue = Queue()
+        upload_process = Process(
+            target=upload_process_body,
+            args=(
+                f"pipe:aws s3 cp - {upload_shard_url}",
+                upload_queue,
+            ),
+        )
+        upload_process.start()
+
         batch_ctr = 0
         img_ctr = 0
         time_to_cuda = 0
@@ -223,17 +246,6 @@ def main():
         time_encoding_f16 = 0
         time_encoding_text_encoder = 0
 
-        upload_shard_url = f"{upload_to}/{shard}.tar"
-        logger.warning(f"Uploading shard {upload_shard_url}")
-        upload_queue = Queue()
-        upload_process = Process(
-            target=upload_process_body,
-            args=(
-                f"pipe:aws s3 cp - {upload_shard_url}",
-                upload_queue,
-            ),
-        )
-        upload_process.start()
         for __key__, image, input_ids in src:
             batch_ctr += 1
             img_ctr += len(__key__)
@@ -292,6 +304,7 @@ def main():
                 upload_queue.put(sample, block=False)
             time_write += time.perf_counter() - t0
 
+        upload_queue.put(None, block=True)
         upload_queue.close()
         upload_process.join()
 
@@ -302,15 +315,27 @@ def main():
         logger.warning("timing")
         logger.warning(f"time_setup: {time_setup}")
         logger.warning(f"time_dataset: {src.timing}")
-        logger.warning(f"time_to_cuda: total: {time_to_cuda}, per batch: {time_to_cuda / batch_ctr}")
-        logger.warning(f"time_encoding_f8: total: {time_encoding_f8}, per batch: {time_encoding_f8 / batch_ctr}")
-        logger.warning(f"time_encoding_f16: total: {time_encoding_f16}, per batch: {time_encoding_f16 / batch_ctr}")
         logger.warning(
-            f"time_encoding_text_encoder: total: {time_encoding_text_encoder}, per batch: {time_encoding_text_encoder / batch_ctr}"
+            f"time_to_cuda: total: {time_to_cuda}, per batch: {time_to_cuda / batch_ctr if batch_ctr != 0 else time_to_cuda}"
         )
-        logger.warning(f"time_to_cpu: total: {time_to_cpu}, per batch: {time_to_cpu / batch_ctr}")
-        logger.warning(f"time_postprocess: total: {time_postprocess}, per batch: {time_postprocess / batch_ctr}")
-        logger.warning(f"time_write: total: {time_write}, per_batch: {time_write / batch_ctr}")
+        logger.warning(
+            f"time_encoding_f8: total: {time_encoding_f8}, per batch: {time_encoding_f8 / batch_ctr if batch_ctr != 0 else time_encoding_f8}"
+        )
+        logger.warning(
+            f"time_encoding_f16: total: {time_encoding_f16}, per batch: {time_encoding_f16 / batch_ctr if batch_ctr != 0 else time_encoding_f16}"
+        )
+        logger.warning(
+            f"time_encoding_text_encoder: total: {time_encoding_text_encoder}, per batch: {time_encoding_text_encoder / batch_ctr if batch_ctr != 0 else time_encoding_text_encoder}"
+        )
+        logger.warning(
+            f"time_to_cpu: total: {time_to_cpu}, per batch: {time_to_cpu / batch_ctr if batch_ctr != 0 else time_to_cpu}"
+        )
+        logger.warning(
+            f"time_postprocess: total: {time_postprocess}, per batch: {time_postprocess / batch_ctr if batch_ctr != 0 else time_postprocess}"
+        )
+        logger.warning(
+            f"time_write: total: {time_write}, per_batch: {time_write / batch_ctr if batch_ctr != 0 else time_write}"
+        )
         logger.warning("************")
 
 
