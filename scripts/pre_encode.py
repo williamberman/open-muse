@@ -79,17 +79,25 @@ class TimingWrapper:
             yield next_
 
 
-def upload_process_body(fileobj, upload_queue):
+def upload_process_body(fileobj, upload_queue, skip_upload):
     logger.warning(f"upload process: starting {fileobj}")
 
-    with wds.TarWriter(fileobj) as dst:
+    if not skip_upload:
+        with wds.TarWriter(fileobj) as dst:
+            while True:
+                sample = upload_queue.get(block=True)
+
+                if sample is None:
+                    break
+
+                dst.write(sample)
+    else:
+        logger.warning("upload process: skipping uploads")
         while True:
             sample = upload_queue.get(block=True)
 
             if sample is None:
                 break
-
-            dst.write(sample)
 
     upload_queue.close()
     logger.warning(f"upload process: finishing {fileobj}")
@@ -128,6 +136,11 @@ def main():
         "--debug",
         action="store_true",
         help="Enable debug. Will syncronize cuda between model calls for better timing measurement.",
+    )
+    parser.add_argument(
+        "--skip_upload",
+        action="store_true",
+        help="Set to not actually upload results, helpful for only testing encoding.",
     )
 
     args = parser.parse_args()
@@ -183,7 +196,7 @@ def main():
     vae_f16.requires_grad_(False)
     vae_f16 = torch.compile(vae_f16, mode="reduce-overhead")
     # TODO - throws illegal access error
-    # vae_f16(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device='cuda'))
+    # vae_f16(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
 
     tokenizer = CLIPTokenizer.from_pretrained(CLIP)
     text_encoder = CLIPTextModel.from_pretrained(CLIP)
@@ -229,10 +242,7 @@ def main():
         upload_queue = Queue()
         upload_process = Process(
             target=upload_process_body,
-            args=(
-                f"pipe:aws s3 cp - {upload_shard_url}",
-                upload_queue,
-            ),
+            args=(f"pipe:aws s3 cp - {upload_shard_url}", upload_queue, args.skip_upload),
         )
         upload_process.start()
 
