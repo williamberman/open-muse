@@ -190,20 +190,23 @@ def main():
     vae_f8.requires_grad_(False)
     # inputs are cropped to fixed size, so will not re-compile
     vae_f8.get_code = torch.compile(vae_f8.get_code, mode="reduce-overhead")
-    vae_f8.get_code(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
+    with torch.cuda.amp.autocast():
+        vae_f8.get_code(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
 
     vae_f16 = VQGANModel.from_pretrained(VQGAN_F16_VQVAE)
     vae_f16.to("cuda")
     vae_f16.requires_grad_(False)
     vae_f16.get_code = torch.compile(vae_f16.get_code, mode="reduce-overhead")
-    vae_f16.get_code(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
+    with torch.cuda.amp.autocast():
+        vae_f16.get_code(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
 
     tokenizer = CLIPTokenizer.from_pretrained(CLIP)
     text_encoder = CLIPTextModel.from_pretrained(CLIP)
     text_encoder.to("cuda")
     text_encoder.requires_grad_(False)
     text_encoder = torch.compile(text_encoder, mode="reduce-overhead")
-    text_encoder(torch.randint(0, 8000, (args.batch_size, tokenizer.model_max_length), device="cuda"))
+    with torch.cuda.amp.autocast():
+        text_encoder(torch.randint(0, 8000, (args.batch_size, tokenizer.model_max_length), device="cuda"))
 
     image_transforms = transforms.Compose(
         [
@@ -267,19 +270,22 @@ def main():
             time_to_cuda += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            encoded_image_f8 = vae_f8.get_code(image)
+            with torch.cuda.amp.autocast():
+                encoded_image_f8 = vae_f8.get_code(image)
             if args.debug:
                 torch.cuda.synchronize()
             time_encoding_f8 += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            encoded_image_f16 = vae_f16.get_code(image)
+            with torch.cuda.amp.autocast():
+                encoded_image_f16 = vae_f16.get_code(image)
             if args.debug:
                 torch.cuda.synchronize()
             time_encoding_f16 += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            encoder_hidden_states = text_encoder(input_ids)[0]
+            with torch.cuda.amp.autocast():
+                encoder_hidden_states = text_encoder(input_ids)[0]
             if args.debug:
                 torch.cuda.synchronize()
             time_encoding_text_encoder += time.perf_counter() - t0
