@@ -25,6 +25,7 @@ import torch
 from torchvision import transforms
 import time
 import torch
+from torch.utils.data import DataLoader
 from multiprocessing import Process, Queue
 
 from muse import (
@@ -208,7 +209,7 @@ def main():
     with torch.cuda.amp.autocast():
         text_encoder(torch.randint(0, 8000, (args.batch_size, tokenizer.model_max_length), device="cuda"))
 
-    image_transforms = transforms.Compose(
+    image_transforms_ = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(args.resolution),
@@ -216,9 +217,34 @@ def main():
         ]
     )
 
+    def image_transforms(images):
+        t0 = time.perf_counter()
+        images = image_transforms_(images)
+        t = time.perf_counter() - t0
+        return images, t
+
     def tokenize(text):
+        t0 = time.perf_counter()
         input_ids = tokenizer(text, padding="max_length", truncation=True, return_tensors="pt").input_ids
-        return input_ids[0]
+        input_ids = input_ids[0]
+        t = time.perf_counter() - t0
+        return input_ids, t
+
+    def collate_with_timesteps(datapoints):
+        all_t = 0
+        all = []
+        for datapoint, t in datapoints:
+            all_t += t
+            all.append(datapoint)
+        all = torch.stack(all)
+        return all, all_t
+
+    def collate_fn(args):
+        __key__, images, input_ids = args
+        images = collate_with_timesteps(images)
+        input_ids = collate_with_timesteps(input_ids)
+
+        return __key__, images, input_ids
 
     time_setup = time.perf_counter() - t0_setup
 
@@ -236,7 +262,15 @@ def main():
             .to_tuple("__key__", "image", "input_ids")
             .batched(args.batch_size)
         )
-        src = wds.WebLoader(src, batch_size=None, shuffle=False, num_workers=1, pin_memory=True)
+        src = DataLoader(
+            src,
+            batch_size=None,
+            shuffle=False,
+            num_workers=1,
+            pin_memory=True,
+            collate_fn=collate_fn,
+            prefetch_factor=5,
+        )
         src = TimingWrapper(src)
 
         upload_shard_url = f"{upload_to}/{shard}.tar"
@@ -258,11 +292,19 @@ def main():
         time_encoding_f8 = 0
         time_encoding_f16 = 0
         time_encoding_text_encoder = 0
+        time_image_dataloader = 0
+        time_tokenize_dataloader = 0
 
         for __key__, image, input_ids in src:
             batch_ctr += 1
             img_ctr += len(__key__)
-            logger.warning(f"Encoding examples {__key__}")
+            logger.warning(f"Encoding examples: {__key__[0]} to {__key__[-1]}.")
+
+            image, time_image_dataloader_ = image
+            time_image_dataloader += time_image_dataloader_
+
+            input_ids, time_tokenize_dataloader_ = input_ids
+            time_tokenize_dataloader += time_tokenize_dataloader_
 
             t0 = time.perf_counter()
             image = image.to("cuda")
@@ -324,34 +366,40 @@ def main():
         upload_queue.close()
         upload_process.join()
 
+        def safe_div_batch_ctr(n):
+            if batch_ctr == 0:
+                return n
+            else:
+                return n / batch_ctr
+
         logger.warning("************")
         logger.warning(f"num batches: {batch_ctr}")
         logger.warning(f"num images: {img_ctr}")
         logger.warning("************")
         logger.warning("timing")
         logger.warning(f"time_setup: {time_setup}")
-        logger.warning(f"time_dataset: {src.timing}")
+        logger.warning(f"time_dataset: total: {src.timing}, per batch: {safe_div_batch_ctr(src.timing)}")
         logger.warning(
-            f"time_to_cuda: total: {time_to_cuda}, per batch: {time_to_cuda / batch_ctr if batch_ctr != 0 else time_to_cuda}"
+            f"time_image_dataloader: total: {time_image_dataloader} per batch: {safe_div_batch_ctr(time_image_dataloader)}"
         )
         logger.warning(
-            f"time_encoding_f8: total: {time_encoding_f8}, per batch: {time_encoding_f8 / batch_ctr if batch_ctr != 0 else time_encoding_f8}"
+            f"time_tokenize_dataloader: total: {time_tokenize_dataloader} per batch: {safe_div_batch_ctr(time_tokenize_dataloader)}"
+        )
+        logger.warning(f"time_to_cuda: total: {time_to_cuda}, per batch: {safe_div_batch_ctr(time_to_cuda)}")
+        logger.warning(
+            f"time_encoding_f8: total: {time_encoding_f8}, per batch: {safe_div_batch_ctr(time_encoding_f8)}"
         )
         logger.warning(
-            f"time_encoding_f16: total: {time_encoding_f16}, per batch: {time_encoding_f16 / batch_ctr if batch_ctr != 0 else time_encoding_f16}"
+            f"time_encoding_f16: total: {time_encoding_f16}, per batch: {safe_div_batch_ctr(time_encoding_f16)}"
         )
         logger.warning(
-            f"time_encoding_text_encoder: total: {time_encoding_text_encoder}, per batch: {time_encoding_text_encoder / batch_ctr if batch_ctr != 0 else time_encoding_text_encoder}"
+            f"time_encoding_text_encoder: total: {time_encoding_text_encoder}, per batch: {safe_div_batch_ctr(time_encoding_text_encoder)}"
         )
+        logger.warning(f"time_to_cpu: total: {time_to_cpu}, per batch: {safe_div_batch_ctr(time_to_cpu)}")
         logger.warning(
-            f"time_to_cpu: total: {time_to_cpu}, per batch: {time_to_cpu / batch_ctr if batch_ctr != 0 else time_to_cpu}"
+            f"time_postprocess: total: {time_postprocess}, per batch: {safe_div_batch_ctr(time_postprocess)}"
         )
-        logger.warning(
-            f"time_postprocess: total: {time_postprocess}, per batch: {time_postprocess / batch_ctr if batch_ctr != 0 else time_postprocess}"
-        )
-        logger.warning(
-            f"time_write: total: {time_write}, per_batch: {time_write / batch_ctr if batch_ctr != 0 else time_write}"
-        )
+        logger.warning(f"time_write: total: {time_write}, per_batch: {safe_div_batch_ctr(time_write)}")
         logger.warning("************")
 
 
