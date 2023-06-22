@@ -22,7 +22,8 @@ import argparse
 import logging
 import webdataset as wds
 import torch
-from torchvision import transforms
+import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
 import time
 import torch
 from torch.utils.data import DataLoader
@@ -209,19 +210,15 @@ def main():
     with torch.cuda.amp.autocast():
         text_encoder(torch.randint(0, 8000, (args.batch_size, tokenizer.model_max_length), device="cuda"))
 
-    image_transforms_ = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-        ]
-    )
-
     def image_transforms(images):
         t0 = time.perf_counter()
-        images = image_transforms_(images)
-        t = time.perf_counter() - t0
-        return images, t
+        images = TF.resize(images, size=args.resolution, interpolation=InterpolationMode.BILINEAR)
+        t1 = time.perf_counter()
+        images = TF.center_crop(images, args.resolution)
+        t2 = time.perf_counter()
+        images = TF.to_tensor(images)
+        t3 = time.perf_counter()
+        return images, t1 - t0, t2 - t1, t3 - t2
 
     def tokenize(text):
         t0 = time.perf_counter()
@@ -230,19 +227,26 @@ def main():
         t = time.perf_counter() - t0
         return input_ids, t
 
-    def collate_with_timesteps(datapoints):
-        all_t = 0
+    def collate_with_timings(datapoints):
+        num_timings = len(datapoints[0]) - 1
+
+        all_t = [0] * num_timings
         all = []
-        for datapoint, t in datapoints:
-            all_t += t
+
+        for datapoint, *t in datapoints:
+            for i in range(num_timings):
+                all_t[i] += t[i]
+
             all.append(datapoint)
+
         all = torch.stack(all)
-        return all, all_t
+
+        return all, *all_t
 
     def collate_fn(args):
         __key__, images, input_ids = args
-        images = collate_with_timesteps(images)
-        input_ids = collate_with_timesteps(input_ids)
+        images = collate_with_timings(images)
+        input_ids = collate_with_timings(input_ids)
 
         return __key__, images, input_ids
 
@@ -292,7 +296,9 @@ def main():
         time_encoding_f8 = 0
         time_encoding_f16 = 0
         time_encoding_text_encoder = 0
-        time_image_dataloader = 0
+        time_image_dataloader_resize = 0
+        time_image_dataloader_center_crop = 0
+        time_image_dataloader_to_tensor = 0
         time_tokenize_dataloader = 0
 
         for __key__, image, input_ids in src:
@@ -300,8 +306,15 @@ def main():
             img_ctr += len(__key__)
             logger.warning(f"Encoding examples: {__key__[0]} to {__key__[-1]}.")
 
-            image, time_image_dataloader_ = image
-            time_image_dataloader += time_image_dataloader_
+            (
+                image,
+                time_image_dataloader_resize_,
+                time_image_dataloader_center_crop_,
+                time_image_dataloader_to_tensor_,
+            ) = image
+            time_image_dataloader_resize += time_image_dataloader_resize_
+            time_image_dataloader_center_crop += time_image_dataloader_center_crop_
+            time_image_dataloader_to_tensor += time_image_dataloader_to_tensor_
 
             input_ids, time_tokenize_dataloader_ = input_ids
             time_tokenize_dataloader += time_tokenize_dataloader_
@@ -372,34 +385,31 @@ def main():
             else:
                 return n / batch_ctr
 
+        def log_batched(name, n):
+            logger.warning(f"{name}: total: {n}, per batch: {safe_div_batch_ctr(n)}")
+
         logger.warning("************")
         logger.warning(f"num batches: {batch_ctr}")
         logger.warning(f"num images: {img_ctr}")
         logger.warning("************")
         logger.warning("timing")
         logger.warning(f"time_setup: {time_setup}")
-        logger.warning(f"time_dataset: total: {src.timing}, per batch: {safe_div_batch_ctr(src.timing)}")
-        logger.warning(
-            f"time_image_dataloader: total: {time_image_dataloader} per batch: {safe_div_batch_ctr(time_image_dataloader)}"
+        log_batched("time_dataset", src.timing)
+        log_batched("time_image_dataloader_resize", time_image_dataloader_resize)
+        log_batched("time_image_dataloader_center_crop", time_image_dataloader_center_crop)
+        log_batched("time_image_dataloader_to_tensor", time_image_dataloader_to_tensor)
+        time_image_dataloader = (
+            time_image_dataloader_resize + time_image_dataloader_center_crop + time_image_dataloader_to_tensor
         )
-        logger.warning(
-            f"time_tokenize_dataloader: total: {time_tokenize_dataloader} per batch: {safe_div_batch_ctr(time_tokenize_dataloader)}"
-        )
-        logger.warning(f"time_to_cuda: total: {time_to_cuda}, per batch: {safe_div_batch_ctr(time_to_cuda)}")
-        logger.warning(
-            f"time_encoding_f8: total: {time_encoding_f8}, per batch: {safe_div_batch_ctr(time_encoding_f8)}"
-        )
-        logger.warning(
-            f"time_encoding_f16: total: {time_encoding_f16}, per batch: {safe_div_batch_ctr(time_encoding_f16)}"
-        )
-        logger.warning(
-            f"time_encoding_text_encoder: total: {time_encoding_text_encoder}, per batch: {safe_div_batch_ctr(time_encoding_text_encoder)}"
-        )
-        logger.warning(f"time_to_cpu: total: {time_to_cpu}, per batch: {safe_div_batch_ctr(time_to_cpu)}")
-        logger.warning(
-            f"time_postprocess: total: {time_postprocess}, per batch: {safe_div_batch_ctr(time_postprocess)}"
-        )
-        logger.warning(f"time_write: total: {time_write}, per_batch: {safe_div_batch_ctr(time_write)}")
+        log_batched("time_image_dataloader", time_image_dataloader)
+        log_batched("time_tokenize_dataloader", time_tokenize_dataloader)
+        log_batched("time_to_cuda", time_to_cuda)
+        log_batched("time_encoding_f8", time_encoding_f8)
+        log_batched("time_encoding_f16", time_encoding_f16)
+        log_batched("time_encoding_text_encoder", time_encoding_text_encoder)
+        log_batched("time_to_cpu", time_to_cpu)
+        log_batched("time_postprocess", time_postprocess)
+        log_batched("time_write", time_write)
         logger.warning("************")
 
 
