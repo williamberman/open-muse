@@ -306,9 +306,9 @@ def main():
             ):
                 sample = {
                     "__key__": __key__,
-                    f"{'.'.join(PAELLA_F8_VQVAE.split('/'))}.pth": encoded_image_f8,
-                    f"{'.'.join(VQGAN_F16_VQVAE.split('/'))}.pth": encoded_image_f16,
-                    f"{'.'.join(CLIP.split('/'))}.pth": encoder_hidden_states,
+                    PAELLA_F8_VQVAE_EXT: encoded_image_f8,
+                    VQGAN_F16_VQVAE_EXT: encoded_image_f16,
+                    CLIP_EXT: encoder_hidden_states,
                 }
 
                 upload_queue.put(sample, block=False)
