@@ -368,6 +368,7 @@ def main():
         logger.warning(f"Uploading shard {upload_shard_url}")
 
         try:
+            process_shutdown = False
             upload_queue = Queue()
             upload_process = Process(
                 target=upload_process_body,
@@ -427,7 +428,9 @@ def main():
                     time_image_dataloader_convert += time.perf_counter() - t0
 
                     t0 = time.perf_counter()
-                    image_ = TF.resize(image_, size=args.resolution, interpolation=InterpolationMode.BILINEAR, antialias=True)
+                    image_ = TF.resize(
+                        image_, size=args.resolution, interpolation=InterpolationMode.BILINEAR, antialias=True
+                    )
                     if args.debug:
                         torch.cuda.synchronize()
                     time_image_dataloader_resize += time.perf_counter() - t0
@@ -489,11 +492,13 @@ def main():
             upload_queue.put(None, block=True)
             upload_queue.close()
             upload_process.join()
+            process_shutdown = True
         finally:
             # TODO probably not exactly correct. Could have already put None on the queue and/or called close
-            upload_queue.put(None, block=True)
-            upload_queue.close()
-            upload_process.join()
+            if not process_shutdown:
+                upload_queue.put(None, block=True)
+                upload_queue.close()
+                upload_process.join()
 
         def safe_div_batch_ctr(n):
             if batch_ctr == 0:
