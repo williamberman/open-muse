@@ -28,6 +28,8 @@ import time
 import torch
 from torch.utils.data import DataLoader
 from multiprocessing import Process, Queue
+import numpy as np
+from PIL.Image import Image
 
 from muse import (
     PaellaVQModel,
@@ -210,15 +212,33 @@ def main():
     with torch.cuda.amp.autocast():
         text_encoder(torch.randint(0, 8000, (args.batch_size, tokenizer.model_max_length), device="cuda"))
 
-    def image_transforms(images):
+    def image_transforms(image: Image):
         t0 = time.perf_counter()
-        images = TF.resize(images, size=args.resolution, interpolation=InterpolationMode.BILINEAR)
+
+        mode = image.mode
+
+        height = image.height
+        width = image.width
+
+        if hasattr(image, "getbands"):
+            channels = len(image.getbands())
+        else:
+            channels = image.channels
+
+        if mode == "I":
+            nptype = np.int32
+        elif mode == "I;16":
+            nptype = np.int16
+        elif mode == "F":
+            nptype = np.float32
+        else:
+            nptype = np.uint8
+
+        image = np.array(image, nptype)
+        image = torch.from_numpy(image)
+
         t1 = time.perf_counter()
-        images = TF.center_crop(images, args.resolution)
-        t2 = time.perf_counter()
-        images = TF.to_tensor(images)
-        t3 = time.perf_counter()
-        return images, t1 - t0, t2 - t1, t3 - t2
+        return image, mode, height, width, channels, t1 - t0
 
     def tokenize(text):
         t0 = time.perf_counter()
@@ -243,9 +263,23 @@ def main():
 
         return all, *all_t
 
+    def collate_images_with_timings(images):
+        num_timings = len(images[0]) - 5
+
+        all_t = [0] * num_timings
+        images_ = []
+
+        for image, mode, height, width, channels, *t in images:
+            for i in range(num_timings):
+                all_t[i] += t[i]
+
+            images_.append((image, mode, height, width, channels))
+
+        return images_, *all_t
+
     def collate_fn(args):
         __key__, images, input_ids = args
-        images = collate_with_timings(images)
+        images = collate_images_with_timings(images)
         input_ids = collate_with_timings(input_ids)
 
         return __key__, images, input_ids
@@ -296,33 +330,64 @@ def main():
         time_encoding_f8 = 0
         time_encoding_f16 = 0
         time_encoding_text_encoder = 0
+        time_image_dataloader_to_tensor = 0
+        time_image_dataloader_convert = 0
         time_image_dataloader_resize = 0
         time_image_dataloader_center_crop = 0
-        time_image_dataloader_to_tensor = 0
         time_tokenize_dataloader = 0
 
         for __key__, image, input_ids in src:
             batch_ctr += 1
             img_ctr += len(__key__)
-            logger.warning(f"Encoding examples: {__key__[0]} to {__key__[-1]}.")
+            logger.warning(f"Encoding {len(__key__)} examples: {__key__[0]} to {__key__[-1]}.")
 
             (
                 image,
-                time_image_dataloader_resize_,
-                time_image_dataloader_center_crop_,
                 time_image_dataloader_to_tensor_,
             ) = image
-            time_image_dataloader_resize += time_image_dataloader_resize_
-            time_image_dataloader_center_crop += time_image_dataloader_center_crop_
             time_image_dataloader_to_tensor += time_image_dataloader_to_tensor_
 
             input_ids, time_tokenize_dataloader_ = input_ids
             time_tokenize_dataloader += time_tokenize_dataloader_
 
             t0 = time.perf_counter()
-            image = image.to("cuda")
             input_ids = input_ids.to("cuda")
             time_to_cuda += time.perf_counter() - t0
+
+            all_images = []
+
+            for image_, mode, height, width, channels in image:
+                t0 = time.perf_counter()
+                image_ = image_.to("cuda")
+                if args.debug:
+                    torch.cuda.synchronize()
+                time_to_cuda += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                image_ = image_.view(height, width, channels)
+                image_ = image_.permute((2, 0, 1)).contiguous()
+
+                if mode != "1" and image_.dtype == torch.uint8:
+                    image_ = image_.to(dtype=torch.float32).div(255)
+                if args.debug:
+                    torch.cuda.synchronize()
+                time_image_dataloader_convert += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                image_ = TF.resize(image_, size=args.resolution, interpolation=InterpolationMode.BILINEAR)
+                if args.debug:
+                    torch.cuda.synchronize()
+                time_image_dataloader_resize += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                image_ = TF.center_crop(image_, args.resolution)
+                if args.debug:
+                    torch.cuda.synchronize()
+                time_image_dataloader_center_crop += time.perf_counter() - t0
+
+                all_images.append(image_)
+
+            image = torch.stack(all_images)
 
             t0 = time.perf_counter()
             with torch.cuda.amp.autocast():
@@ -394,12 +459,16 @@ def main():
         logger.warning("************")
         logger.warning("timing")
         logger.warning(f"time_setup: {time_setup}")
-        log_batched("time_dataset", src.timing)
+        log_batched("time_dataloader", src.timing)
+        log_batched("time_image_dataloader_to_tensor", time_image_dataloader_to_tensor)
+        log_batched("time_image_dataloader_convert", time_image_dataloader_convert)
         log_batched("time_image_dataloader_resize", time_image_dataloader_resize)
         log_batched("time_image_dataloader_center_crop", time_image_dataloader_center_crop)
-        log_batched("time_image_dataloader_to_tensor", time_image_dataloader_to_tensor)
         time_image_dataloader = (
-            time_image_dataloader_resize + time_image_dataloader_center_crop + time_image_dataloader_to_tensor
+            time_image_dataloader_to_tensor
+            + time_image_dataloader_convert
+            + time_image_dataloader_resize
+            + time_image_dataloader_center_crop
         )
         log_batched("time_image_dataloader", time_image_dataloader)
         log_batched("time_tokenize_dataloader", time_tokenize_dataloader)
