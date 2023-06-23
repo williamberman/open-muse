@@ -324,7 +324,6 @@ def main():
         batch_ctr = 0
         img_ctr = 0
         time_to_cuda = 0
-        time_to_cpu = 0
         time_postprocess = 0
         time_write = 0
         time_encoding_f8 = 0
@@ -409,18 +408,12 @@ def main():
                 torch.cuda.synchronize()
             time_encoding_text_encoder += time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            encoded_image_f8 = encoded_image_f8.to("cpu")
-            encoded_image_f16 = encoded_image_f16.to("cpu")
-            encoder_hidden_states = encoder_hidden_states.to("cpu")
-            time_to_cpu += time.perf_counter() - t0
-
             # when saving a view of a tensor, pytorch will save the entirety of the original tensor.
             # cloning the view, will save just the subset of the original tensor.
             t0 = time.perf_counter()
-            encoded_image_f8 = [x.clone() for x in torch.unbind(encoded_image_f8)]
-            encoded_image_f16 = [x.clone() for x in torch.unbind(encoded_image_f16)]
-            encoder_hidden_states = [x.clone() for x in torch.unbind(encoder_hidden_states)]
+            encoded_image_f8 = [x.clone().to("cpu") for x in torch.unbind(encoded_image_f8)]
+            encoded_image_f16 = [x.clone().to("cpu") for x in torch.unbind(encoded_image_f16)]
+            encoder_hidden_states = [x.clone().to("cpu") for x in torch.unbind(encoder_hidden_states)]
             time_postprocess += time.perf_counter() - t0
 
             logger.warning("Writing examples")
@@ -475,7 +468,6 @@ def main():
         log_batched("time_encoding_f8", time_encoding_f8)
         log_batched("time_encoding_f16", time_encoding_f16)
         log_batched("time_encoding_text_encoder", time_encoding_text_encoder)
-        log_batched("time_to_cpu", time_to_cpu)
         log_batched("time_postprocess", time_postprocess)
         log_batched("time_write", time_write)
         logger.warning("************")
