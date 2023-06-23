@@ -59,6 +59,43 @@ COYO_PRE_ENCODED = "s3://muse-datasets/hf-datasets-coyo-700m-pre-encoded"
 
 logger = logging.getLogger(__name__)
 
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--dataset",
+    type=str,
+    help="The dataset to pre-encode",
+    choices=["laion_5", "laion_6", "coyo"],
+    required=True,
+)
+parser.add_argument(
+    "--start_shard",
+    type=int,
+    help="The starting shard to pre-encode.",
+    required=True,
+)
+parser.add_argument(
+    "--end_shard",
+    type=int,
+    help="The ending shard to pre-encode, inclusive. If not given, defaults to `--start_shard`.",
+    required=False,
+)
+parser.add_argument("--batch_size", type=int, help="The batch size to encode at a time", required=False, default=160)
+parser.add_argument(
+    "--resolution", type=int, help="The resolution to convert the image to.", required=False, default=256
+)
+parser.add_argument(
+    "--debug",
+    action="store_true",
+    help="Enable debug. Will syncronize cuda between model calls for better timing measurement.",
+)
+parser.add_argument(
+    "--skip_upload",
+    action="store_true",
+    help="Set to not actually upload results, helpful for only testing encoding.",
+)
+
+args = parser.parse_args()
+
 
 class TimingWrapper:
     def __init__(self, wrap):
@@ -107,47 +144,133 @@ def upload_process_body(fileobj, upload_queue, skip_upload):
     logger.warning(f"upload process: finishing {fileobj}")
 
 
+def dataset_filter_dict(dict):
+    return {"__key__": dict["__key__"], "image": dict["image"], "input_ids": dict["input_ids"]}
+
+
+def image_transforms(image: Image):
+    t0 = time.perf_counter()
+
+    mode = image.mode
+
+    height = image.height
+    width = image.width
+
+    if hasattr(image, "getbands"):
+        channels = len(image.getbands())
+    else:
+        channels = image.channels
+
+    if mode == "I":
+        nptype = np.int32
+    elif mode == "I;16":
+        nptype = np.int16
+    elif mode == "F":
+        nptype = np.float32
+    else:
+        nptype = np.uint8
+
+    image = np.array(image, nptype)
+    image = torch.from_numpy(image)
+    time_image_dataloader_to_tensor = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    image = image.to("cuda")
+    if args.debug:
+        torch.cuda.synchronize()
+    time_to_cuda = time.perf_counter() - t0
+
+    image = image.view(height, width, channels)
+    image = image.permute((2, 0, 1)).contiguous()
+
+    if mode != "1" and image.dtype == torch.uint8:
+        image = image.to(dtype=torch.float32).div(255)
+    if args.debug:
+        torch.cuda.synchronize()
+    time_image_dataloader_convert = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    image = TF.resize(image, size=args.resolution, interpolation=InterpolationMode.BILINEAR)
+    if args.debug:
+        torch.cuda.synchronize()
+    time_image_dataloader_resize = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    image = TF.center_crop(image, args.resolution)
+    if args.debug:
+        torch.cuda.synchronize()
+    time_image_dataloader_center_crop = time.perf_counter() - t0
+
+    return (
+        image,
+        time_image_dataloader_to_tensor,
+        time_to_cuda,
+        time_image_dataloader_convert,
+        time_image_dataloader_resize,
+        time_image_dataloader_center_crop,
+    )
+
+
+tokenizer = CLIPTokenizerFast.from_pretrained(CLIP)
+
+
+def tokenize(text):
+    t0 = time.perf_counter()
+    input_ids = tokenizer(text, padding="max_length", truncation=True, return_tensors="pt").input_ids
+    input_ids = input_ids[0]
+    time_tokenize_dataloader = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    input_ids = input_ids.to("cuda")
+    if args.debug:
+        torch.cuda.synchronize()
+    time_to_cuda = time.perf_counter() - t0
+
+    return input_ids, time_tokenize_dataloader, time_to_cuda
+
+
+def collate_with_timings(datapoints):
+    num_timings = len(datapoints[0]) - 1
+
+    all_t = [0] * num_timings
+    all = []
+
+    for datapoint, *t in datapoints:
+        for i in range(num_timings):
+            all_t[i] += t[i]
+
+        all.append(datapoint)
+
+    all = torch.stack(all)
+
+    return all, *all_t
+
+
+def collate_images_with_timings(images):
+    num_timings = len(images[0]) - 5
+
+    all_t = [0] * num_timings
+    images_ = []
+
+    for image, mode, height, width, channels, *t in images:
+        for i in range(num_timings):
+            all_t[i] += t[i]
+
+        images_.append((image, mode, height, width, channels))
+
+    return images_, *all_t
+
+
+def collate_fn(args):
+    __key__, images, input_ids = args
+    images = collate_with_timings(images)
+    input_ids = collate_with_timings(input_ids)
+
+    return __key__, images, input_ids
+
+
 def main():
     t0_setup = time.perf_counter()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        help="The dataset to pre-encode",
-        choices=["laion_5", "laion_6", "coyo"],
-        required=True,
-    )
-    parser.add_argument(
-        "--start_shard",
-        type=int,
-        help="The starting shard to pre-encode.",
-        required=True,
-    )
-    parser.add_argument(
-        "--end_shard",
-        type=int,
-        help="The ending shard to pre-encode, inclusive. If not given, defaults to `--start_shard`.",
-        required=False,
-    )
-    parser.add_argument(
-        "--batch_size", type=int, help="The batch size to encode at a time", required=False, default=160
-    )
-    parser.add_argument(
-        "--resolution", type=int, help="The resolution to convert the image to.", required=False, default=256
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug. Will syncronize cuda between model calls for better timing measurement.",
-    )
-    parser.add_argument(
-        "--skip_upload",
-        action="store_true",
-        help="Set to not actually upload results, helpful for only testing encoding.",
-    )
-
-    args = parser.parse_args()
 
     if args.end_shard is None:
         args.end_shard = args.start_shard
@@ -197,82 +320,9 @@ def main():
     vae_f16.to("cuda")
     vae_f16.requires_grad_(False)
 
-    tokenizer = CLIPTokenizerFast.from_pretrained(CLIP)
     text_encoder = CLIPTextModel.from_pretrained(CLIP)
     text_encoder.to_bettertransformer()
     text_encoder.to("cuda")
-
-    def image_transforms(image: Image):
-        t0 = time.perf_counter()
-
-        mode = image.mode
-
-        height = image.height
-        width = image.width
-
-        if hasattr(image, "getbands"):
-            channels = len(image.getbands())
-        else:
-            channels = image.channels
-
-        if mode == "I":
-            nptype = np.int32
-        elif mode == "I;16":
-            nptype = np.int16
-        elif mode == "F":
-            nptype = np.float32
-        else:
-            nptype = np.uint8
-
-        image = np.array(image, nptype)
-        image = torch.from_numpy(image)
-
-        t1 = time.perf_counter()
-        return image, mode, height, width, channels, t1 - t0
-
-    def tokenize(text):
-        t0 = time.perf_counter()
-        input_ids = tokenizer(text, padding="max_length", truncation=True, return_tensors="pt").input_ids
-        input_ids = input_ids[0]
-        t = time.perf_counter() - t0
-        return input_ids, t
-
-    def collate_with_timings(datapoints):
-        num_timings = len(datapoints[0]) - 1
-
-        all_t = [0] * num_timings
-        all = []
-
-        for datapoint, *t in datapoints:
-            for i in range(num_timings):
-                all_t[i] += t[i]
-
-            all.append(datapoint)
-
-        all = torch.stack(all)
-
-        return all, *all_t
-
-    def collate_images_with_timings(images):
-        num_timings = len(images[0]) - 5
-
-        all_t = [0] * num_timings
-        images_ = []
-
-        for image, mode, height, width, channels, *t in images:
-            for i in range(num_timings):
-                all_t[i] += t[i]
-
-            images_.append((image, mode, height, width, channels))
-
-        return images_, *all_t
-
-    def collate_fn(args):
-        __key__, images, input_ids = args
-        images = collate_images_with_timings(images)
-        input_ids = collate_with_timings(input_ids)
-
-        return __key__, images, input_ids
 
     time_setup = time.perf_counter() - t0_setup
 
@@ -285,7 +335,7 @@ def main():
             wds.WebDataset(f"pipe:aws s3 cp {download_shard_url} -")
             .decode("pil")
             .rename(image="jpg;png;jpeg;webp", input_ids="text;txt;caption")
-            .map(lambda dict: {"__key__": dict["__key__"], "image": dict["image"], "input_ids": dict["input_ids"]})
+            .map(dataset_filter_dict)
             .map_dict(image=image_transforms, input_ids=tokenize)
             .to_tuple("__key__", "image", "input_ids")
             .batched(args.batch_size)
@@ -295,7 +345,7 @@ def main():
             batch_size=None,
             shuffle=False,
             num_workers=1,
-            pin_memory=True,
+            # pin_memory=True,
             collate_fn=collate_fn,
             prefetch_factor=5,
         )
@@ -333,50 +383,20 @@ def main():
             (
                 image,
                 time_image_dataloader_to_tensor_,
+                time_to_cuda_,
+                time_image_dataloader_convert_,
+                time_image_dataloader_resize_,
+                time_image_dataloader_center_crop_,
             ) = image
             time_image_dataloader_to_tensor += time_image_dataloader_to_tensor_
+            time_to_cuda += time_to_cuda_
+            time_image_dataloader_convert += time_image_dataloader_convert_
+            time_image_dataloader_resize += time_image_dataloader_resize_
+            time_image_dataloader_center_crop += time_image_dataloader_center_crop_
 
-            input_ids, time_tokenize_dataloader_ = input_ids
+            input_ids, time_tokenize_dataloader_, time_to_cuda_ = input_ids
             time_tokenize_dataloader += time_tokenize_dataloader_
-
-            t0 = time.perf_counter()
-            input_ids = input_ids.to("cuda")
-            time_to_cuda += time.perf_counter() - t0
-
-            all_images = []
-
-            for image_, mode, height, width, channels in image:
-                t0 = time.perf_counter()
-                image_ = image_.to("cuda")
-                if args.debug:
-                    torch.cuda.synchronize()
-                time_to_cuda += time.perf_counter() - t0
-
-                t0 = time.perf_counter()
-                image_ = image_.view(height, width, channels)
-                image_ = image_.permute((2, 0, 1)).contiguous()
-
-                if mode != "1" and image_.dtype == torch.uint8:
-                    image_ = image_.to(dtype=torch.float32).div(255)
-                if args.debug:
-                    torch.cuda.synchronize()
-                time_image_dataloader_convert += time.perf_counter() - t0
-
-                t0 = time.perf_counter()
-                image_ = TF.resize(image_, size=args.resolution, interpolation=InterpolationMode.BILINEAR)
-                if args.debug:
-                    torch.cuda.synchronize()
-                time_image_dataloader_resize += time.perf_counter() - t0
-
-                t0 = time.perf_counter()
-                image_ = TF.center_crop(image_, args.resolution)
-                if args.debug:
-                    torch.cuda.synchronize()
-                time_image_dataloader_center_crop += time.perf_counter() - t0
-
-                all_images.append(image_)
-
-            image = torch.stack(all_images)
+            time_to_cuda += time_to_cuda_
 
             t0 = time.perf_counter()
             with torch.cuda.amp.autocast():
@@ -464,4 +484,5 @@ def main():
 
 
 if __name__ == "__main__":
+    torch.multiprocessing.set_start_method("spawn")
     main()
