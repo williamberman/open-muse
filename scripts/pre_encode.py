@@ -427,7 +427,7 @@ def main():
                     time_image_dataloader_convert += time.perf_counter() - t0
 
                     t0 = time.perf_counter()
-                    image_ = TF.resize(image_, size=args.resolution, interpolation=InterpolationMode.BILINEAR)
+                    image_ = TF.resize(image_, size=args.resolution, interpolation=InterpolationMode.BILINEAR, antialias=True)
                     if args.debug:
                         torch.cuda.synchronize()
                     time_image_dataloader_resize += time.perf_counter() - t0
