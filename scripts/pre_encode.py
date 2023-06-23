@@ -36,7 +36,7 @@ from muse import (
     VQGANModel,
 )
 
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import CLIPTokenizerFast, CLIPTextModel
 
 torch.set_float32_matmul_precision("high")
 torch.set_grad_enabled(False)
@@ -204,7 +204,7 @@ def main():
     with torch.cuda.amp.autocast():
         vae_f16.get_code(torch.rand((args.batch_size, 3, args.resolution, args.resolution), device="cuda"))
 
-    tokenizer = CLIPTokenizer.from_pretrained(CLIP)
+    tokenizer = CLIPTokenizerFast.from_pretrained(CLIP)
     text_encoder = CLIPTextModel.from_pretrained(CLIP)
     text_encoder.to("cuda")
     text_encoder.requires_grad_(False)
