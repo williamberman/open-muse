@@ -206,11 +206,11 @@ def main():
 
     tokenizer = CLIPTokenizerFast.from_pretrained(CLIP)
     text_encoder = CLIPTextModel.from_pretrained(CLIP)
+    text_encoder.to_bettertransformer()
     text_encoder.to("cuda")
     text_encoder.requires_grad_(False)
     text_encoder = torch.compile(text_encoder, mode="reduce-overhead")
-    with torch.cuda.amp.autocast():
-        text_encoder(torch.randint(0, 8000, (args.batch_size, tokenizer.model_max_length), device="cuda"))
+    text_encoder(torch.randint(0, 8000, (args.batch_size, tokenizer.model_max_length), device="cuda"))
 
     def image_transforms(image: Image):
         t0 = time.perf_counter()
@@ -404,8 +404,7 @@ def main():
             time_encoding_f16 += time.perf_counter() - t0
 
             t0 = time.perf_counter()
-            with torch.cuda.amp.autocast():
-                encoder_hidden_states = text_encoder(input_ids)[0]
+            encoder_hidden_states = text_encoder(input_ids)[0]
             if args.debug:
                 torch.cuda.synchronize()
             time_encoding_text_encoder += time.perf_counter() - t0
