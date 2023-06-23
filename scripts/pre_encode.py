@@ -367,127 +367,133 @@ def main():
         upload_shard_url = f"{upload_to}/{shard}.tar"
         logger.warning(f"Uploading shard {upload_shard_url}")
 
-        upload_queue = Queue()
-        upload_process = Process(
-            target=upload_process_body,
-            args=(f"pipe:aws s3 cp - {upload_shard_url}", upload_queue, args.skip_upload),
-        )
-        upload_process.start()
+        try:
+            upload_queue = Queue()
+            upload_process = Process(
+                target=upload_process_body,
+                args=(f"pipe:aws s3 cp - {upload_shard_url}", upload_queue, args.skip_upload),
+            )
+            upload_process.start()
 
-        batch_ctr = 0
-        img_ctr = 0
-        time_to_cuda = 0
-        time_postprocess = 0
-        time_write = 0
-        time_encoding_f8 = 0
-        time_encoding_f16 = 0
-        time_encoding_text_encoder = 0
-        time_image_dataloader_to_tensor = 0
-        time_image_dataloader_convert = 0
-        time_image_dataloader_resize = 0
-        time_image_dataloader_center_crop = 0
-        time_tokenize_dataloader = 0
+            batch_ctr = 0
+            img_ctr = 0
+            time_to_cuda = 0
+            time_postprocess = 0
+            time_write = 0
+            time_encoding_f8 = 0
+            time_encoding_f16 = 0
+            time_encoding_text_encoder = 0
+            time_image_dataloader_to_tensor = 0
+            time_image_dataloader_convert = 0
+            time_image_dataloader_resize = 0
+            time_image_dataloader_center_crop = 0
+            time_tokenize_dataloader = 0
 
-        for __key__, image, input_ids in src:
-            batch_ctr += 1
-            img_ctr += len(__key__)
-            logger.warning(f"Encoding {len(__key__)} examples: {__key__[0]} to {__key__[-1]}.")
+            for __key__, image, input_ids in src:
+                batch_ctr += 1
+                img_ctr += len(__key__)
+                logger.warning(f"Encoding {len(__key__)} examples: {__key__[0]} to {__key__[-1]}.")
 
-            (
-                image,
-                time_image_dataloader_to_tensor_,
-            ) = image
-            time_image_dataloader_to_tensor += time_image_dataloader_to_tensor_
+                (
+                    image,
+                    time_image_dataloader_to_tensor_,
+                ) = image
+                time_image_dataloader_to_tensor += time_image_dataloader_to_tensor_
 
-            input_ids, time_tokenize_dataloader_ = input_ids
-            time_tokenize_dataloader += time_tokenize_dataloader_
+                input_ids, time_tokenize_dataloader_ = input_ids
+                time_tokenize_dataloader += time_tokenize_dataloader_
 
-            t0 = time.perf_counter()
-            input_ids = input_ids.to("cuda")
-            time_to_cuda += time.perf_counter() - t0
-
-            all_images = []
-
-            for image_, mode, height, width, channels in image:
                 t0 = time.perf_counter()
-                image_ = image_.to("cuda")
-                if args.debug:
-                    torch.cuda.synchronize()
+                input_ids = input_ids.to("cuda")
                 time_to_cuda += time.perf_counter() - t0
 
-                t0 = time.perf_counter()
-                image_ = image_.view(height, width, channels)
-                image_ = image_.permute((2, 0, 1)).contiguous()
+                all_images = []
 
-                if mode != "1" and image_.dtype == torch.uint8:
-                    image_ = image_.to(dtype=torch.float32).div(255)
+                for image_, mode, height, width, channels in image:
+                    t0 = time.perf_counter()
+                    image_ = image_.to("cuda")
+                    if args.debug:
+                        torch.cuda.synchronize()
+                    time_to_cuda += time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
+                    image_ = image_.view(height, width, channels)
+                    image_ = image_.permute((2, 0, 1)).contiguous()
+
+                    if mode != "1" and image_.dtype == torch.uint8:
+                        image_ = image_.to(dtype=torch.float32).div(255)
+                    if args.debug:
+                        torch.cuda.synchronize()
+                    time_image_dataloader_convert += time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
+                    image_ = TF.resize(image_, size=args.resolution, interpolation=InterpolationMode.BILINEAR)
+                    if args.debug:
+                        torch.cuda.synchronize()
+                    time_image_dataloader_resize += time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
+                    image_ = TF.center_crop(image_, args.resolution)
+                    if args.debug:
+                        torch.cuda.synchronize()
+                    time_image_dataloader_center_crop += time.perf_counter() - t0
+
+                    all_images.append(image_)
+
+                image = torch.stack(all_images)
+
+                t0 = time.perf_counter()
+                with torch.cuda.amp.autocast():
+                    encoded_image_f8 = vae_f8.get_code(image)
                 if args.debug:
                     torch.cuda.synchronize()
-                time_image_dataloader_convert += time.perf_counter() - t0
+                time_encoding_f8 += time.perf_counter() - t0
 
                 t0 = time.perf_counter()
-                image_ = TF.resize(image_, size=args.resolution, interpolation=InterpolationMode.BILINEAR)
+                with torch.cuda.amp.autocast():
+                    encoded_image_f16 = vae_f16.get_code(image)
                 if args.debug:
                     torch.cuda.synchronize()
-                time_image_dataloader_resize += time.perf_counter() - t0
+                time_encoding_f16 += time.perf_counter() - t0
 
                 t0 = time.perf_counter()
-                image_ = TF.center_crop(image_, args.resolution)
+                encoder_hidden_states = text_encoder(input_ids)[0]
                 if args.debug:
                     torch.cuda.synchronize()
-                time_image_dataloader_center_crop += time.perf_counter() - t0
+                time_encoding_text_encoder += time.perf_counter() - t0
 
-                all_images.append(image_)
+                # when saving a view of a tensor, pytorch will save the entirety of the original tensor.
+                # cloning the view, will save just the subset of the original tensor.
+                t0 = time.perf_counter()
+                encoded_image_f8 = [x.clone().to("cpu") for x in torch.unbind(encoded_image_f8)]
+                encoded_image_f16 = [x.clone().to("cpu") for x in torch.unbind(encoded_image_f16)]
+                encoder_hidden_states = [x.clone().to("cpu") for x in torch.unbind(encoder_hidden_states)]
+                time_postprocess += time.perf_counter() - t0
 
-            image = torch.stack(all_images)
+                logger.warning("Writing examples")
 
-            t0 = time.perf_counter()
-            with torch.cuda.amp.autocast():
-                encoded_image_f8 = vae_f8.get_code(image)
-            if args.debug:
-                torch.cuda.synchronize()
-            time_encoding_f8 += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                for __key__, encoded_image_f8, encoded_image_f16, encoder_hidden_states in zip(
+                    __key__, encoded_image_f8, encoded_image_f16, encoder_hidden_states
+                ):
+                    sample = {
+                        "__key__": __key__,
+                        PAELLA_F8_VQVAE_EXT: encoded_image_f8,
+                        VQGAN_F16_VQVAE_EXT: encoded_image_f16,
+                        CLIP_EXT: encoder_hidden_states,
+                    }
 
-            t0 = time.perf_counter()
-            with torch.cuda.amp.autocast():
-                encoded_image_f16 = vae_f16.get_code(image)
-            if args.debug:
-                torch.cuda.synchronize()
-            time_encoding_f16 += time.perf_counter() - t0
+                    upload_queue.put(sample, block=False)
+                time_write += time.perf_counter() - t0
 
-            t0 = time.perf_counter()
-            encoder_hidden_states = text_encoder(input_ids)[0]
-            if args.debug:
-                torch.cuda.synchronize()
-            time_encoding_text_encoder += time.perf_counter() - t0
-
-            # when saving a view of a tensor, pytorch will save the entirety of the original tensor.
-            # cloning the view, will save just the subset of the original tensor.
-            t0 = time.perf_counter()
-            encoded_image_f8 = [x.clone().to("cpu") for x in torch.unbind(encoded_image_f8)]
-            encoded_image_f16 = [x.clone().to("cpu") for x in torch.unbind(encoded_image_f16)]
-            encoder_hidden_states = [x.clone().to("cpu") for x in torch.unbind(encoder_hidden_states)]
-            time_postprocess += time.perf_counter() - t0
-
-            logger.warning("Writing examples")
-
-            t0 = time.perf_counter()
-            for __key__, encoded_image_f8, encoded_image_f16, encoder_hidden_states in zip(
-                __key__, encoded_image_f8, encoded_image_f16, encoder_hidden_states
-            ):
-                sample = {
-                    "__key__": __key__,
-                    PAELLA_F8_VQVAE_EXT: encoded_image_f8,
-                    VQGAN_F16_VQVAE_EXT: encoded_image_f16,
-                    CLIP_EXT: encoder_hidden_states,
-                }
-
-                upload_queue.put(sample, block=False)
-            time_write += time.perf_counter() - t0
-
-        upload_queue.put(None, block=True)
-        upload_queue.close()
-        upload_process.join()
+            upload_queue.put(None, block=True)
+            upload_queue.close()
+            upload_process.join()
+        finally:
+            # TODO probably not exactly correct. Could have already put None on the queue and/or called close
+            upload_queue.put(None, block=True)
+            upload_queue.close()
+            upload_process.join()
 
         def safe_div_batch_ctr(n):
             if batch_ctr == 0:
