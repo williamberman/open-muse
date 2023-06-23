@@ -1,4 +1,6 @@
-# This script is used for pre-encoding both laion and coyo.
+# This script is used for pre-encoding both laion and coyo for open-muse
+#
+# ### What we are encoding
 #
 # We pre-encode both captions and images. The captions are all encoded with the CLIP
 # checkpoint https://huggingface.co/openMUSE/CLIP-ViT-L-14-DataComp.XL-s13B-b90K-penultimate
@@ -6,6 +8,9 @@
 # The images are pre-encoded with two different vae models,
 # https://huggingface.co/openMUSE/paellavq-f8-8192-laion and
 # https://huggingface.co/openMUSE/vqgan-f16-8192-laion
+#
+#
+# ### file structure of the encoded shard
 #
 # We re-upload a single new set of tar archive containing all embeddings:
 # <n>.tar
@@ -17,6 +22,64 @@
 # Re-uploading a single new tar archive simplifies the pre-embedding and training code.
 # The only downside is the downloading of an un-used embedding at train time, but this
 # should be fine if we're not bottlenecked by shard download speed.
+#
+#
+# ### Process orchestration
+#
+# We launch a single main encoding process per each GPU. Each single main
+# encoding process streams downloads -> encoding -> uploads so all work is non-blocking.
+#
+# Shards themselves are processed serially -- that is at any one time a single main encoding process
+# is pulling from a single shard and re-uploading to the single analog encoded shard.
+# Given that a main encoding process is only processing a single shard at a time, there's no
+# benefit from running multiple dataloader processes. wds dataloading processes will split amongst shards
+# and feed batches from all shards to the training loop where in we wouldn't know which shard
+# a batch comes from. We could theoretically track which shard each batch comes from and concurrenly
+# maintain multiple upload streams but that might require modifications to wds and we have decent enough
+# perf already.
+#
+# All image preprocessing - resize, scaling, etc... - besides decoding and conversion to a torch tensor
+# are done in the main encoding process instead of the dataloader process. This is so they can occur in cuda.
+# Doing the image preprocessing on cuda in the dataloader process, has performance issues (unknown why).
+# Doing the image preprocessing on cpu in the dataloader process makes the dataloader a bottleneck.
+#
+#
+# ### Notes
+#
+# - We do not use torch.compile the models as it causes VRAM memory leaks (unknown why)
+# - torch.compile actually causes worse performance for the CLIP model
+# - We use better transformers for CLIP for fused attention kernels
+#
+#
+# ### Diagram
+#
+# S3 read bucket
+# |
+# | - streams tar archive into memory
+# |
+# v
+# wds dataloader process
+# |
+# | - tokenizes prompts (using fast tokenizers)
+# | - converts images to torch cpu tensor
+# |
+# v
+# dataloader pinning process
+# |
+# v
+# main encoding process
+# |
+# | - encodes the tokenized prompt
+# | - encodes the image with the f8 and f16 vaes
+# |
+# v
+# writing process
+# |
+# | - streams tar archive to post-processed S3 bucket (under muse-datasets)
+# |
+# v
+# S3 write bucket
+
 
 import argparse
 import logging
