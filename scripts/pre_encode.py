@@ -93,6 +93,7 @@ from torch.utils.data import DataLoader
 from multiprocessing import Process, Queue
 import numpy as np
 from PIL.Image import Image
+import os
 
 from muse import (
     PaellaVQModel,
@@ -170,6 +171,35 @@ def upload_process_body(fileobj, upload_queue, skip_upload):
     logger.warning(f"upload process: finishing {fileobj}")
 
 
+def distribute_shards(start_shard_all, end_shard_all, slurm_ntasks):
+    total_shards = end_shard_all - start_shard_all + 1
+    shards_per_task = total_shards // slurm_ntasks
+    shards_per_task = [shards_per_task] * slurm_ntasks
+
+    # to distribute the remainder of tasks for non-evenly divisible number of shards
+    left_over_shards = total_shards % slurm_ntasks
+
+    for slurm_procid in range(left_over_shards):
+        shards_per_task[slurm_procid] += 1
+
+    assert sum(shards_per_task) == total_shards
+
+    distributed_shards = []
+
+    for slurm_procid in range(len(shards_per_task)):
+        if slurm_procid == 0:
+            start_shard = start_shard_all
+        else:
+            start_shard = distributed_shards[slurm_procid - 1][1] + 1
+
+        end_shard = start_shard + shards_per_task[slurm_procid] - 1
+        distributed_shards.append((start_shard, end_shard))
+
+    assert sum([end_shard - start_shard + 1 for start_shard, end_shard in distributed_shards]) == total_shards
+
+    return distributed_shards
+
+
 def main():
     t0_setup = time.perf_counter()
 
@@ -194,6 +224,17 @@ def main():
         required=False,
     )
     parser.add_argument(
+        "--slurm",
+        type=bool,
+        action="store_true",
+        help=(
+            "If set, this process is running under a batch of slurm tasks."
+            "`--start_shard` and `--end_shard` must be set for the entirety of shards over all slurm tasks."
+            " The shards that will be encoded in each instance of the task will be determined via"
+            " the env vars `$SLURM_NTASKS` and `$SLURM_PROCID`."
+        ),
+    )
+    parser.add_argument(
         "--batch_size", type=int, help="The batch size to encode at a time", required=False, default=160
     )
     parser.add_argument(
@@ -212,17 +253,20 @@ def main():
 
     args = parser.parse_args()
 
+    if args.slurm and args.end_shard is None:
+        raise ValueError("`--end_shard` must be set when `--slurm` is set")
+
     if args.end_shard is None:
         args.end_shard = args.start_shard
 
     if args.end_shard < args.start_shard:
-        raise ValueError("end_shard must be >= start_shard")
+        raise ValueError("`--end_shard` must be >= `--start_shard`")
 
     if args.batch_size < 1:
-        raise ValueError("batch_size must be >= 1")
+        raise ValueError("`--batch_size` must be >= 1")
 
     if args.resolution < 1:
-        raise ValueError("resolution must be >= 1")
+        raise ValueError("`--resolution` must be >= 1")
 
     if args.dataset == "laion_5":
         args.dataset = LAION_AESTHETICS_V2_5_PLUS
@@ -251,6 +295,28 @@ def main():
     logger.warning(f"batch_size: {args.batch_size}")
     logger.warning(f"debug: {args.debug}")
     logger.warning("********************")
+
+    if args.slurm:
+        slurm_procid = int(os.environ["SLURM_PROCID"])
+        slurm_ntasks = int(os.environ["SLURM_NTASKS"])
+
+        distributed_shards = distribute_shards(args.start_shard, args.end_shard, slurm_ntasks)
+
+        start_shard_task, end_shard_task = distributed_shards[slurm_procid]
+
+        args.start_shard = start_shard_task
+        args.end_shard = end_shard_task
+
+        logger.warning("************")
+        logger.warning("Running as slurm task")
+        logger.warning(f"SLURM_NTASKS: {slurm_ntasks}")
+        logger.warning(f"SLURM_PROCID: {slurm_procid}")
+        logger.warning(f"start_shard: {start_shard_task}, end_shard: {end_shard_task}")
+        logger.warning("************")
+        logger.warning(f"all slurm processes")
+        for slurm_proc_id_, (start_shard, end_shard) in enumerate(distributed_shards):
+            logger.warning(f"slurm process: {slurm_proc_id_}, start_shard: {start_shard}, end_shard: {end_shard}")
+        logger.warning("************")
 
     vae_f8 = PaellaVQModel.from_pretrained(PAELLA_F8_VQVAE)
     vae_f8.to("cuda")
