@@ -225,7 +225,6 @@ def main():
     )
     parser.add_argument(
         "--slurm",
-        type=bool,
         action="store_true",
         help=(
             "If set, this process is running under a batch of slurm tasks."
