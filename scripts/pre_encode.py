@@ -83,17 +83,19 @@
 
 import argparse
 import logging
-import webdataset as wds
+from webdataset import TarWriter
 import torch
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 import time
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from multiprocessing import Process, Queue
 import numpy as np
-from PIL.Image import Image
+from PIL import Image
 import os
+from subprocess import Popen, PIPE
+import tarfile
 
 from muse import (
     PaellaVQModel,
@@ -151,7 +153,7 @@ def upload_process_body(fileobj, upload_queue, skip_upload):
     logger.warning(f"upload process: starting {fileobj}")
 
     if not skip_upload:
-        with wds.TarWriter(fileobj) as dst:
+        with TarWriter(fileobj) as dst:
             while True:
                 sample = upload_queue.get(block=True)
 
@@ -198,6 +200,87 @@ def distribute_shards(start_shard_all, end_shard_all, slurm_ntasks):
     assert sum([end_shard - start_shard + 1 for start_shard, end_shard in distributed_shards]) == total_shards
 
     return distributed_shards
+
+
+class PreEncodeDataset(IterableDataset):
+    def __init__(self, s3_download_shard_uri, batch_size, tokenizer):
+        self.s3_download_shard_uri = s3_download_shard_uri
+        self.batch_size = batch_size
+        self.tokenizer = tokenizer
+
+    def __iter__(self):
+        proc = Popen(["aws", "s3", "cp", self.s3_download_shard_uri, "-"], stdout=PIPE)
+        tarfile_stream = tarfile.open(fileobj=proc.stdout, mode="r|*")
+
+        keys_batch = []
+        input_ids_batch = []
+        image_batch = []
+
+        for tarinfo in tarfile_stream:
+            filename, file_extension = os.path.splitext(tarinfo.name)
+
+            if file_extension == ".json":
+                continue
+
+            if file_extension not in [".txt", ".jpg"]:
+                assert False, file_extension
+
+            if len(keys_batch) == 0 or keys_batch[-1] != filename:
+                keys_batch.append(filename)
+
+            file_contents = tarfile_stream.extractfile(tarinfo)
+
+            if file_extension == ".txt":
+                prompt = file_contents.read()
+                prompt = prompt.decode("utf-8")
+
+                input_ids = self.tokenizer(
+                    prompt, padding="max_length", truncation=True, return_tensors="pt"
+                ).input_ids
+                input_ids = input_ids[0]
+
+                input_ids_batch.append(input_ids)
+            elif file_extension == ".jpg":
+                image = Image.open(file_contents)
+                image.load()
+                image = image.convert("RGB")
+
+                mode = image.mode
+
+                height = image.height
+                width = image.width
+
+                if hasattr(image, "getbands"):
+                    channels = len(image.getbands())
+                else:
+                    channels = image.channels
+
+                if mode == "I":
+                    nptype = np.int32
+                elif mode == "I;16":
+                    nptype = np.int16
+                elif mode == "F":
+                    nptype = np.float32
+                else:
+                    nptype = np.uint8
+
+                image = np.array(image, nptype)
+                image = torch.from_numpy(image)
+
+                image_batch.append((image, mode, height, width, channels))
+
+            if len(image_batch) == self.batch_size and len(input_ids_batch) == self.batch_size:
+                yield keys_batch, image_batch, torch.stack(input_ids_batch)
+
+                keys_batch = []
+                input_ids_batch = []
+                image_batch = []
+
+        if len(image_batch) > 0:
+            yield keys_batch, image_batch, torch.stack(input_ids_batch)
+
+        proc.stdout.close()
+        proc.wait()
 
 
 def main():
@@ -330,101 +413,20 @@ def main():
     text_encoder.to_bettertransformer()
     text_encoder.to("cuda")
 
-    def image_transforms(image: Image):
-        t0 = time.perf_counter()
-
-        mode = image.mode
-
-        height = image.height
-        width = image.width
-
-        if hasattr(image, "getbands"):
-            channels = len(image.getbands())
-        else:
-            channels = image.channels
-
-        if mode == "I":
-            nptype = np.int32
-        elif mode == "I;16":
-            nptype = np.int16
-        elif mode == "F":
-            nptype = np.float32
-        else:
-            nptype = np.uint8
-
-        image = np.array(image, nptype)
-        image = torch.from_numpy(image)
-
-        t1 = time.perf_counter()
-        return image, mode, height, width, channels, t1 - t0
-
-    def tokenize(text):
-        t0 = time.perf_counter()
-        input_ids = tokenizer(text, padding="max_length", truncation=True, return_tensors="pt").input_ids
-        input_ids = input_ids[0]
-        t = time.perf_counter() - t0
-        return input_ids, t
-
-    def collate_with_timings(datapoints):
-        num_timings = len(datapoints[0]) - 1
-
-        all_t = [0] * num_timings
-        all = []
-
-        for datapoint, *t in datapoints:
-            for i in range(num_timings):
-                all_t[i] += t[i]
-
-            all.append(datapoint)
-
-        all = torch.stack(all)
-
-        return all, *all_t
-
-    def collate_images_with_timings(images):
-        num_timings = len(images[0]) - 5
-
-        all_t = [0] * num_timings
-        images_ = []
-
-        for image, mode, height, width, channels, *t in images:
-            for i in range(num_timings):
-                all_t[i] += t[i]
-
-            images_.append((image, mode, height, width, channels))
-
-        return images_, *all_t
-
-    def collate_fn(args):
-        __key__, images, input_ids = args
-        images = collate_images_with_timings(images)
-        input_ids = collate_with_timings(input_ids)
-
-        return __key__, images, input_ids
-
     time_setup = time.perf_counter() - t0_setup
 
     for shard in range(args.start_shard, args.end_shard + 1):
         shard = "{:0>{}}".format(shard, 5)
-        download_shard_url = f"{args.dataset}/{shard}.tar"
-        logger.warning(f"Downloading shard {download_shard_url}")
+        s3_download_shard_uri = f"{args.dataset}/{shard}.tar"
+        logger.warning(f"Downloading shard {s3_download_shard_uri}")
 
-        src = (
-            wds.WebDataset(f"pipe:aws s3 cp {download_shard_url} -")
-            .decode("pil")
-            .rename(image="jpg;png;jpeg;webp", input_ids="text;txt;caption")
-            .map(lambda dict: {"__key__": dict["__key__"], "image": dict["image"], "input_ids": dict["input_ids"]})
-            .map_dict(image=image_transforms, input_ids=tokenize)
-            .to_tuple("__key__", "image", "input_ids")
-            .batched(args.batch_size)
-        )
+        src = PreEncodeDataset(s3_download_shard_uri, args.batch_size, tokenizer)
         src = DataLoader(
             src,
             batch_size=None,
             shuffle=False,
             num_workers=1,
             pin_memory=True,
-            collate_fn=collate_fn,
             prefetch_factor=5,
         )
         src = TimingWrapper(src)
@@ -460,16 +462,19 @@ def main():
                 img_ctr += len(__key__)
                 logger.warning(f"Encoding {len(__key__)} examples: {__key__[0]} to {__key__[-1]}.")
 
-                (
-                    image,
-                    time_image_dataloader_to_tensor_,
-                ) = image
-                time_image_dataloader_to_tensor += time_image_dataloader_to_tensor_
+                # (
+                #     image,
+                #     time_image_dataloader_to_tensor_,
+                # ) = image
+                # time_image_dataloader_to_tensor += time_image_dataloader_to_tensor_
 
-                input_ids, time_tokenize_dataloader_ = input_ids
-                time_tokenize_dataloader += time_tokenize_dataloader_
+                # input_ids, time_tokenize_dataloader_ = input_ids
+                # time_tokenize_dataloader += time_tokenize_dataloader_
+
+                # import ipdb; ipdb.set_trace()
 
                 t0 = time.perf_counter()
+                # input_ids = torch.from_numpy(input_ids)
                 input_ids = input_ids.to("cuda")
                 time_to_cuda += time.perf_counter() - t0
 
@@ -477,6 +482,7 @@ def main():
 
                 for image_, mode, height, width, channels in image:
                     t0 = time.perf_counter()
+                    # image_ = torch.from_numpy(image_)
                     image_ = image_.to("cuda")
                     if args.debug:
                         torch.cuda.synchronize()
