@@ -17,22 +17,26 @@ LAION_AESTHETICS_V2_6_PLUS_PRE_ENCODED_WITH_DEDUP_METADATA = (
 )
 
 LAION_AESTHETICS_V2_5_PLUS_PRE_ENCODED = "s3://muse-datasets/hf-datasets-laion-aesthetics-v2-5-plus-data-pre-encoded"
+LAION_AESTHETICS_V2_5_PLUS_PRE_ENCODED_WITH_DEDUP_METADATA = "s3://muse-datasets/hf-datasets-laion-aesthetics-v2-5-plus-data-pre-encoded-with-dedup-metadata"
 
 COYO_PRE_ENCODED = "s3://muse-datasets/hf-datasets-coyo-700m-pre-encoded"
+COYO_PRE_ENCODED_WITH_DEDUP_METADATA = "s3://muse-datasets/hf-datasets-coyo-700m-pre-encoded-with-dedup-metadata"
 
 
 def get_dedup_metadata_index():
     dedup_metadata_index = {}
 
-    for idx in range(1, 11):
+    for idx in range(1, 19):
         t0 = time.perf_counter()
-        filename = f"dedup-{idx}.txt"
+        filename = f"dedup-url-{idx}.txt"
 
         logger.warning(f"loading {filename}")
 
         with open(filename) as f:
             for line in f.readlines():
-                shasum, shard = line.split(" ")
+                space = line.rfind(" ")
+                shasum = line[:space]
+                shard = line[space+1:]
                 shard = int(shard)
                 dedup_metadata_index[shasum] = shard
         
@@ -93,15 +97,15 @@ def add_metadata_to_shard(dataset, upload_to, shard, dedup_metadata_index, s3):
     write_time = 0
 
     for it in src:
-        sha256 = it["json"]["sha256"]
+        lookup_value = it["json"]["url"]
 
         t1 = time.perf_counter()
-        dedup_metadata_shard_number = dedup_metadata_index.get(sha256, None)
+        dedup_metadata_shard_number = dedup_metadata_index.get(lookup_value, None)
         hash_lookup_time += time.perf_counter() - t1
 
         if dedup_metadata_shard_number is None:
             # NOTE: helpful for debugging but makes actual logs noisy
-            # logger.warning(f"no dedup metadata found for {sha256}")
+            # logger.warning(f"no dedup metadata found for {lookup_value}")
             num_not_found += 1
         else:
             num_found += 1
@@ -112,7 +116,7 @@ def add_metadata_to_shard(dataset, upload_to, shard, dedup_metadata_index, s3):
 
             t3 = time.perf_counter()
             if df is not None:
-                dedup_metadata = df[df.sha256 == sha256].iloc[0].to_json()
+                dedup_metadata = df[df.url == lookup_value].iloc[0].to_json()
 
                 # NOTE: mutation
                 it["json"]["dedup_metadata"] = dedup_metadata
@@ -163,8 +167,18 @@ def distribute_shards(start_shard_all, end_shard_all, slurm_ntasks):
 
 def main(args):
     s3 = boto3.client("s3")
-    dataset = LAION_AESTHETICS_V2_6_PLUS_PRE_ENCODED
-    upload_to = LAION_AESTHETICS_V2_6_PLUS_PRE_ENCODED_WITH_DEDUP_METADATA
+
+    if args.dataset == "laion_6":
+        dataset = LAION_AESTHETICS_V2_6_PLUS_PRE_ENCODED
+        upload_to = LAION_AESTHETICS_V2_6_PLUS_PRE_ENCODED_WITH_DEDUP_METADATA
+    elif args.dataset == "laion_5":
+        dataset = LAION_AESTHETICS_V2_5_PLUS_PRE_ENCODED
+        upload_to = LAION_AESTHETICS_V2_5_PLUS_PRE_ENCODED_WITH_DEDUP_METADATA
+    elif args.dataset == "coyo":
+        dataset = COYO_PRE_ENCODED
+        upload_to = COYO_PRE_ENCODED_WITH_DEDUP_METADATA
+    else:
+        assert False
 
     if args.slurm:
         slurm_procid = int(os.environ["SLURM_PROCID"])
@@ -196,6 +210,13 @@ def main(args):
 
 def args():
     parser = ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        help="The dataset to augment",
+        choices=["laion_5", "laion_6", "coyo"],
+        required=True,
+    )
     parser.add_argument(
         "--start_shard",
         type=int,
