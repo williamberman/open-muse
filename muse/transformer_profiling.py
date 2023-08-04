@@ -230,6 +230,7 @@ class TransformerLayer(nn.Module):
             normed_hidden_states,
             encoder_hidden_states,
             encoder_hidden_states,
+            need_weights=False,
         )[0]
         hidden_states = hidden_states + residual
 
