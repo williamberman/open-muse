@@ -121,6 +121,9 @@ class MaskGitUVit(nn.Module):
         hidden_states = hidden_states.permute(0, 3, 1, 2)
         logits = self.out["conv2"](hidden_states)
 
+        logits = logits.permute(0, 2, 3, 1)
+        logits = logits.reshape(batch_size, seq_length, -1)
+
         return logits
 
 
@@ -213,7 +216,7 @@ class TransformerLayer(nn.Module):
     def forward(self, hidden_states, encoder_hidden_states, encoder_attention_mask=None):
         residual = hidden_states
         normed_hidden_states = self.self_attention_layer_norm(hidden_states)
-        hidden_states = self.attention(
+        hidden_states = self.self_attention(
             normed_hidden_states,
             normed_hidden_states,
             normed_hidden_states,
