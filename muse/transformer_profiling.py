@@ -1,7 +1,13 @@
 import torch
 import torch.nn.functional as F
-from apex.normalization import FusedRMSNorm as RMSNorm  # noqa
+from apex.normalization import FusedRMSNorm
 from torch import nn
+
+
+class RMSNorm(FusedRMSNorm):
+    def __init__(self, *args, **kwargs):
+        assert not kwargs.pop("use_bias")
+        super().__init__(*args, **kwargs)
 
 
 class MaskGitUVit(nn.Module):
@@ -19,13 +25,23 @@ class MaskGitUVit(nn.Module):
         num_attention_heads=16,
         dropout_p=0.0,
         use_bias=False,
+        norm_cls=None,
+        ffn_cls=None,
     ):
         super().__init__()
+
+        if norm_cls is None:
+            norm_cls = RMSNorm
+
+        if ffn_cls is None:
+            ffn_cls = OrigMuseTransformerFFN
 
         self.embed = nn.ModuleDict(
             dict(
                 embeddings=nn.Embedding(input_vocab_size, embedding_size),
-                layer_norm=RMSNorm(embedding_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine),
+                layer_norm=norm_cls(
+                    embedding_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine, use_bias=use_bias
+                ),
                 conv=nn.Conv2d(embedding_size, hidden_size, kernel_size=1, bias=use_bias),
             )
         )
@@ -38,6 +54,7 @@ class MaskGitUVit(nn.Module):
                     layer_norm_eps=layer_norm_eps,
                     ln_elementwise_affine=ln_elementwise_affine,
                     dropout_p=dropout_p,
+                    norm_cls=norm_cls,
                 )
                 for _ in range(num_res_blocks)
             ],
@@ -53,11 +70,15 @@ class MaskGitUVit(nn.Module):
                     ln_elementwise_affine=ln_elementwise_affine,
                     num_heads=num_attention_heads,
                     dropout_p=dropout_p,
+                    norm_cls=norm_cls,
+                    ffn_cls=ffn_cls,
                 )
                 for _ in range(num_transformer_layers)
             ]
         )
-        self.encoder_layer_norm = RMSNorm(hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine)
+        self.encoder_layer_norm = norm_cls(
+            hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine, use_bias=use_bias
+        )
 
         self.up_blocks = nn.Sequential(
             *[
@@ -67,6 +88,7 @@ class MaskGitUVit(nn.Module):
                     layer_norm_eps=layer_norm_eps,
                     ln_elementwise_affine=ln_elementwise_affine,
                     dropout_p=dropout_p,
+                    norm_cls=norm_cls,
                 )
                 for _ in range(num_res_blocks)
             ],
@@ -75,7 +97,9 @@ class MaskGitUVit(nn.Module):
         self.out = nn.ModuleDict(
             dict(
                 conv1=nn.Conv2d(hidden_size, embedding_size, kernel_size=1, bias=use_bias),
-                norm=RMSNorm(embedding_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine),
+                norm=norm_cls(
+                    embedding_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine, use_bias=use_bias
+                ),
                 conv2=nn.Conv2d(embedding_size, output_vocab_size, kernel_size=1, bias=use_bias),
             )
         )
@@ -135,6 +159,7 @@ class ResBlock(nn.Module):
         layer_norm_eps,
         ln_elementwise_affine,
         dropout_p,
+        norm_cls,
     ):
         super().__init__()
         self.depthwise = nn.Conv2d(
@@ -145,7 +170,7 @@ class ResBlock(nn.Module):
             groups=channels,
             bias=use_bias,
         )
-        self.norm = RMSNorm(channels, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine)
+        self.norm = norm_cls(channels, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine, use_bias=use_bias)
         self.channelwise = nn.Sequential(
             nn.Linear(channels, channels * 4, bias=False),
             nn.GELU(),
@@ -175,11 +200,13 @@ class TransformerLayer(nn.Module):
         ln_elementwise_affine,
         num_heads,
         dropout_p,
+        norm_cls,
+        ffn_cls,
     ):
         super().__init__()
 
-        self.self_attention_layer_norm = RMSNorm(
-            hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine
+        self.self_attention_layer_norm = norm_cls(
+            hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine, use_bias=use_bias
         )
         self.self_attention = nn.MultiheadAttention(
             embed_dim=hidden_size,
@@ -188,20 +215,9 @@ class TransformerLayer(nn.Module):
             bias=use_bias,
             batch_first=True,
         )
-        self.ffn = nn.ModuleDict(
-            dict(
-                ln=LayerNormOptionalBias(
-                    hidden_size, eps=layer_norm_eps, use_bias=use_bias, elementwise_affine=ln_elementwise_affine
-                ),
-                wi_0=nn.Linear(hidden_size, hidden_size * 4, bias=use_bias),
-                wi_1=nn.Linear(hidden_size, hidden_size * 4, bias=use_bias),
-                dropout=nn.Dropout(dropout_p),
-                wo=nn.Linear(hidden_size * 4, hidden_size, bias=use_bias),
-            )
-        )
 
-        self.cross_attention_layer_norm = RMSNorm(
-            hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine
+        self.cross_attention_layer_norm = norm_cls(
+            hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine, use_bias=use_bias
         )
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=hidden_size,
@@ -211,6 +227,19 @@ class TransformerLayer(nn.Module):
             dropout=dropout_p,
             bias=use_bias,
             batch_first=True,
+        )
+
+        # NOTE this is always regular LayerNorm in the original source, which I'm assuming is not intended
+        self.ff_layer_norm = norm_cls(
+            hidden_size,
+            eps=layer_norm_eps,
+            use_bias=use_bias,
+            elementwise_affine=ln_elementwise_affine,
+        )
+        self.ffn = ffn_cls(
+            hidden_size=hidden_size,
+            use_bias=use_bias,
+            dropout_p=dropout_p,
         )
 
     def forward(self, hidden_states, encoder_hidden_states, encoder_attention_mask=None):
@@ -235,19 +264,46 @@ class TransformerLayer(nn.Module):
         hidden_states = hidden_states + residual
 
         residual = hidden_states
+        normed_hidden_states = self.ff_layer_norm(hidden_states)
+        hidden_states = self.ffn(hidden_states)
+        hidden_states = hidden_states + residual
 
-        hidden_states = self.ffn["ln"](hidden_states)
+        return hidden_states
 
-        hidden_gelu = F.gelu(self.ffn["wi_0"](hidden_states))
-        hidden_linear = self.ffn["wi_1"](hidden_states)
+
+class OrigMuseTransformerFFN(nn.Module):
+    def __init__(self, hidden_size, use_bias, dropout_p):
+        super().__init__()
+        self.wi_0 = nn.Linear(hidden_size, hidden_size * 4, bias=use_bias)
+        self.wi_1 = nn.Linear(hidden_size, hidden_size * 4, bias=use_bias)
+        self.dropout = nn.Dropout(dropout_p)
+        self.wo = nn.Linear(hidden_size * 4, hidden_size, bias=use_bias)
+
+    def forward(self, hidden_states):
+        hidden_gelu = F.gelu(self.wi_0(hidden_states))
+        hidden_linear = self.wi_1(hidden_states)
 
         hidden_states = hidden_gelu * hidden_linear
 
-        hidden_states = self.ffn["dropout"](hidden_states)
-        hidden_states = self.ffn["wo"](hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.wo(hidden_states)
 
-        hidden_states = hidden_states + residual
+        return hidden_states
 
+
+class SingleProjTransformerFFN(nn.Module):
+    def __init__(self, hidden_size, use_bias, dropout_p):
+        super().__init__()
+        self.c_fc = nn.Linear(hidden_size, 4 * hidden_size, bias=use_bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(4 * hidden_size, hidden_size, bias=use_bias)
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, hidden_states):
+        hidden_states = self.c_fc(hidden_states)
+        hidden_states = self.gelu(hidden_states)
+        hidden_states = self.c_proj(hidden_states)
+        hidden_states = self.dropout(hidden_states)
         return hidden_states
 
 
