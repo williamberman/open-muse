@@ -44,17 +44,17 @@ results = []
 
 for config_name, model_args in [
     ("unfused_rms_norm", {"norm_cls": UnfusedRMSNorm}),
-    ("base", {}),
-    ("ln", {"norm_cls": LayerNormOptionalBias}),
-    ("single_proj_ffn", {"ffn_cls": SingleProjTransformerFFN}),
-    ("replace res with transformer", {"num_res_blocks": 0, "num_transformer_layers": 25}),
+    ("base model (no changes)", {}),
+    ("replace rms norm with ln", {"norm_cls": LayerNormOptionalBias}),
+    ("single proj ffn", {"ffn_cls": SingleProjTransformerFFN}),
+    ("replace res with transformer", {"num_res_blocks": 0, "num_transformer_layers": 28}),
     (
-        "all",
+        "all changes",
         {
             "norm_cls": LayerNormOptionalBias,
             "ffn_cls": SingleProjTransformerFFN,
             "num_res_blocks": 0,
-            "num_transformer_layers": 25,
+            "num_transformer_layers": 28,
         },
     ),
 ]:
@@ -73,7 +73,7 @@ for config_name, model_args in [
             globals={"benchmark_fn": benchmark_fn},
             num_threads=1,
             description=config_name,
-            label=str(batch_size),
+            label=f"batch_size {batch_size}",
         ).blocked_autorange(min_run_time=1)
 
         results.append(timer)
