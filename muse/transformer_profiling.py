@@ -3,6 +3,13 @@ import torch.nn.functional as F
 from apex.normalization import FusedRMSNorm
 from torch import nn
 
+try:
+    import xformers.ops as xops
+
+    is_xformers_available = True
+except ImportError:
+    is_xformers_available = False
+
 
 class RMSNorm(FusedRMSNorm):
     def __init__(self, *args, **kwargs):
@@ -108,7 +115,6 @@ class MaskGitUVit(nn.Module):
         self,
         input_ids,
         encoder_hidden_states,
-        encoder_attention_mask=None,
     ):
         batch_size, seq_length = input_ids.shape
 
@@ -130,7 +136,6 @@ class MaskGitUVit(nn.Module):
             hidden_states = layer(
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
             )
 
         hidden_states = self.encoder_layer_norm(hidden_states)
@@ -208,25 +213,22 @@ class TransformerLayer(nn.Module):
         self.self_attention_layer_norm = norm_cls(
             hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine, use_bias=use_bias
         )
-        self.self_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
+        self.self_attention = XFormersSelfAttention(
+            hidden_size=hidden_size,
             num_heads=num_heads,
-            dropout=dropout_p,
-            bias=use_bias,
-            batch_first=True,
+            dropout_p=dropout_p,
+            use_bias=use_bias,
         )
 
         self.cross_attention_layer_norm = norm_cls(
             hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine, use_bias=use_bias
         )
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            kdim=encoder_hidden_size,
-            vdim=encoder_hidden_size,
+        self.cross_attention = XFormersCrossAttention(
+            hidden_size=hidden_size,
+            encoder_hidden_size=encoder_hidden_size,
             num_heads=num_heads,
-            dropout=dropout_p,
-            bias=use_bias,
-            batch_first=True,
+            dropout_p=dropout_p,
+            use_bias=use_bias,
         )
 
         # NOTE this is always regular LayerNorm in the original source, which I'm assuming is not intended
@@ -242,15 +244,12 @@ class TransformerLayer(nn.Module):
             dropout_p=dropout_p,
         )
 
-    def forward(self, hidden_states, encoder_hidden_states, encoder_attention_mask=None):
+    def forward(self, hidden_states, encoder_hidden_states):
         residual = hidden_states
         normed_hidden_states = self.self_attention_layer_norm(hidden_states)
         hidden_states = self.self_attention(
             normed_hidden_states,
-            normed_hidden_states,
-            normed_hidden_states,
-            need_weights=False,
-        )[0]
+        )
         hidden_states = hidden_states + residual
 
         residual = hidden_states
@@ -258,15 +257,145 @@ class TransformerLayer(nn.Module):
         hidden_states = self.cross_attention(
             normed_hidden_states,
             encoder_hidden_states,
-            encoder_hidden_states,
-            need_weights=False,
-        )[0]
+        )
         hidden_states = hidden_states + residual
 
         residual = hidden_states
         normed_hidden_states = self.ff_layer_norm(hidden_states)
         hidden_states = self.ffn(hidden_states)
         hidden_states = hidden_states + residual
+
+        return hidden_states
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads, dropout_p, use_bias):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // self.num_heads
+        self.query = nn.Linear(hidden_size, hidden_size, bias=use_bias)
+        self.key = nn.Linear(hidden_size, hidden_size, bias=use_bias)
+        self.value = nn.Linear(hidden_size, hidden_size, bias=use_bias)
+        self.out = nn.Linear(hidden_size, hidden_size)
+        self.dropout_p = dropout_p
+
+    def forward(self, hidden_states):
+        batch_size, seq_len, _ = hidden_states.shape
+
+        query = self.query(hidden_states)
+        key = self.key(hidden_states)
+        value = self.value(hidden_states)
+
+        query = query.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        key = key.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        value = value.view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        dropout_p = self.dropout_p if self.training else 0
+        hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=dropout_p)
+
+        hidden_states = hidden_states.permute(0, 2, 1, 3).view(batch_size, seq_len, -1)
+
+        hidden_states = self.out(hidden_states)
+
+        return hidden_states
+
+
+class XFormersSelfAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads, dropout_p, use_bias):
+        super().__init__()
+        assert is_xformers_available
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // self.num_heads
+        self.query = nn.Linear(hidden_size, hidden_size, bias=use_bias)
+        self.key = nn.Linear(hidden_size, hidden_size, bias=use_bias)
+        self.value = nn.Linear(hidden_size, hidden_size, bias=use_bias)
+        self.out = nn.Linear(hidden_size, hidden_size)
+        self.dropout_p = dropout_p
+
+    def forward(self, hidden_states):
+        batch_size, seq_len, _ = hidden_states.shape
+
+        query = self.query(hidden_states)
+        key = self.key(hidden_states)
+        value = self.value(hidden_states)
+
+        query = query.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        key = key.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        value = value.view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        dropout_p = self.dropout_p if self.training else 0
+        hidden_states = xops.memory_efficient_attention(query, key, value, p=dropout_p)
+
+        hidden_states = hidden_states.view(batch_size, seq_len, -1)
+
+        hidden_states = self.out(hidden_states)
+
+        return hidden_states
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, hidden_size, encoder_hidden_size, num_heads, dropout_p, use_bias):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // self.num_heads
+        self.query = nn.Linear(hidden_size, hidden_size, bias=use_bias)
+        self.key = nn.Linear(encoder_hidden_size, hidden_size, bias=use_bias)
+        self.value = nn.Linear(encoder_hidden_size, hidden_size, bias=use_bias)
+        self.out = nn.Linear(hidden_size, hidden_size)
+        self.dropout_p = dropout_p
+
+    def forward(self, hidden_states, encoder_hidden_states):
+        batch_size, query_seq_len, _ = hidden_states.shape
+        batch_size, kv_seq_len, _ = encoder_hidden_states.shape
+
+        query = self.query(hidden_states)
+        key = self.key(encoder_hidden_states)
+        value = self.value(encoder_hidden_states)
+
+        query = query.view(batch_size, query_seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        key = key.view(batch_size, kv_seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        value = value.view(batch_size, kv_seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        dropout_p = self.dropout_p if self.training else 0
+        hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=dropout_p)
+
+        hidden_states = hidden_states.permute(0, 2, 1, 3).view(batch_size, query_seq_len, -1)
+
+        hidden_states = self.out(hidden_states)
+
+        return hidden_states
+
+
+class XFormersCrossAttention(nn.Module):
+    def __init__(self, hidden_size, encoder_hidden_size, num_heads, dropout_p, use_bias):
+        super().__init__()
+        assert is_xformers_available
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // self.num_heads
+        self.query = nn.Linear(hidden_size, hidden_size, bias=use_bias)
+        self.key = nn.Linear(encoder_hidden_size, hidden_size, bias=use_bias)
+        self.value = nn.Linear(encoder_hidden_size, hidden_size, bias=use_bias)
+        self.out = nn.Linear(hidden_size, hidden_size)
+        self.dropout_p = dropout_p
+
+    def forward(self, hidden_states, encoder_hidden_states):
+        batch_size, query_seq_len, _ = hidden_states.shape
+        batch_size, kv_seq_len, _ = encoder_hidden_states.shape
+
+        query = self.query(hidden_states)
+        key = self.key(encoder_hidden_states)
+        value = self.value(encoder_hidden_states)
+
+        query = query.view(batch_size, query_seq_len, self.num_heads, self.head_dim)
+        key = key.view(batch_size, kv_seq_len, self.num_heads, self.head_dim)
+        value = value.view(batch_size, kv_seq_len, self.num_heads, self.head_dim)
+
+        dropout_p = self.dropout_p if self.training else 0
+        hidden_states = xops.memory_efficient_attention(query, key, value, p=dropout_p)
+
+        hidden_states = hidden_states.view(batch_size, query_seq_len, -1)
+
+        hidden_states = self.out(hidden_states)
 
         return hidden_states
 
