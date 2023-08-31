@@ -6,7 +6,12 @@ from argparse import ArgumentParser
 import torch
 from diffusers import AutoencoderKL, StableDiffusionPipeline, UNet2DConditionModel
 from torch.utils.benchmark import Compare, Timer
-from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer
+from transformers import (
+    AutoTokenizer,
+    CLIPTextModel,
+    CLIPTextModelWithProjection,
+    CLIPTokenizer,
+)
 
 from muse import PaellaVQModel, PipelineMuse
 from muse.modeling_taming_vqgan import VQGANModel
@@ -21,20 +26,36 @@ prompt = "A high tech solarpunk utopia in the Amazon rainforest"
 
 
 all_models = [
-    "openMUSE/muse-laiona6-uvit-clip-220k",
+    # "openMUSE/muse-laiona6-uvit-clip-220k",
     "runwayml/stable-diffusion-v1-5",
-    "williamberman/laiona6plus_uvit_clip_f8",
+    # "williamberman/laiona6plus_uvit_clip_f8",
+    "williamberman/muse_research_run_benchmarking_512_output",
 ]
 
-all_batch_sizes = [1, 2, 4, 8, 16, 32]
+all_batch_sizes = [
+    1,
+    # 2,
+    # 4,
+    8,
+    # 16,
+    # 32
+]
 
-all_compiled = [None, "default", "reduce-overhead"]
+all_compiled = [
+    None,
+    # "default",
+    # "reduce-overhead"
+]
 
-all_components = ["backbone", "vae", "full"]
-
-all_devices = ["4090", "t4", "a100", "cpu"]
+all_components = [
+    # "backbone",
+    # "vae",
+    "full"
+]
 
 all_timesteps = [12, 20]
+
+all_resolutions = [256, 512]
 
 skip = [
     # 4090 backbone
@@ -66,11 +87,9 @@ skip = [
 
 def main():
     args = ArgumentParser()
-    args.add_argument("--device", required=True)
+    args.add_argument("--device", choices=["4090", "a100", "t4", "cpu"], required=True)
 
     args = args.parse_args()
-
-    assert args.device in all_devices
 
     if args.device in ["4090", "a100", "t4"]:
         dtype = torch.float16
@@ -105,59 +124,62 @@ def main():
                         all_timesteps_ = [None]
 
                     for timesteps in all_timesteps_:
-                        if component in ["backbone", "vae"]:
-                            label = f"single pass {component}"
-                        elif component == "full":
-                            label = "full pipeline"
-                        else:
-                            assert False
+                        for resolution in all_resolutions:
+                            if component in ["backbone", "vae"]:
+                                label = f"single pass {component}"
+                            elif component == "full":
+                                label = "full pipeline"
+                            else:
+                                assert False
 
-                        label = f"{label}, batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}"
-                        description = f"{model}, compiled {compiled}"
+                            label = f"{label}, batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}"
+                            description = f"{model}, compiled {compiled}"
 
-                        print(label)
-                        print(description)
+                            print(label)
+                            print(description)
 
-                        inputs = [
-                            torch_device,
-                            dtype,
-                            compiled,
-                            batch_size,
-                            model,
-                            label,
-                            description,
-                            timesteps,
-                        ]
-
-                        fn = model_config[model][component]["fn"]
-
-                        out, mem_bytes = run_in_subprocess(fn, inputs=inputs)
-
-                        median = out.median * 1000
-
-                        mean = out.mean * 1000
-
-                        iqr = out.iqr * 1000
-
-                        csv_data.append(
-                            [
+                            inputs = [
+                                torch_device,
+                                dtype,
+                                compiled,
                                 batch_size,
                                 model,
-                                str(compiled),
-                                median,
-                                mean,
-                                args.device,
-                                component,
+                                label,
+                                description,
                                 timesteps,
-                                mem_bytes,
-                                iqr,
+                                resolution
                             ]
-                        )
 
-                        Compare([out]).print()
-                        print("*******")
+                            fn = model_config[model][component]["fn"]
 
-    with open("artifacts/all.csv", "a", newline="") as csvfile:
+                            out, mem_bytes = run_in_subprocess(fn, inputs=inputs)
+
+                            median = out.median * 1000
+
+                            mean = out.mean * 1000
+
+                            iqr = out.iqr * 1000
+
+                            csv_data.append(
+                                [
+                                    batch_size,
+                                    model,
+                                    str(compiled),
+                                    median,
+                                    mean,
+                                    args.device,
+                                    component,
+                                    timesteps,
+                                    mem_bytes,
+                                    iqr,
+                                    resolution
+                                ]
+                            )
+
+                            Compare([out]).print()
+                            print("*******")
+
+    with open("benchmark/artifacts/all.csv", "a", newline="") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerows(csv_data)
 
@@ -166,8 +188,13 @@ def muse_benchmark_transformer_backbone(in_queue, out_queue, timeout):
     wrap_subprocess_fn(in_queue, out_queue, timeout, _muse_benchmark_transformer_backbone)
 
 
-def _muse_benchmark_transformer_backbone(device, dtype, compiled, batch_size, model, label, description, timesteps):
-    text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder").to(device)
+def _muse_benchmark_transformer_backbone(device, dtype, compiled, batch_size, model, label, description, timesteps, resolution):
+    if "text_model_cls" in model_config[model]:
+        text_model_cls = model_config[model]["text_model_cls"]
+    else:
+        text_model_cls = CLIPTextModel
+
+    text_encoder = text_model_cls.from_pretrained(model, subfolder="text_encoder").to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(model, subfolder="text_encoder")
 
@@ -187,16 +214,25 @@ def _muse_benchmark_transformer_backbone(device, dtype, compiled, batch_size, mo
     encoder_hidden_states = encoder_hidden_states.to(dtype)
 
     transformer = MaskGiTUViT.from_pretrained(model, subfolder="transformer")
+    transformer.enable_xformers_memory_efficient_attention()
 
     transformer = transformer.to(device=device, dtype=dtype)
 
     if compiled is not None:
         transformer = torch.compile(transformer, mode=compiled)
 
-    image_tokens = torch.full((batch_size, 256), fill_value=5, dtype=torch.long, device=device)
+    seq_len = (resolution // 16) ** 2
+
+    image_tokens = torch.full((batch_size, seq_len), fill_value=5, dtype=torch.long, device=device)
+
+    micro_conds = list((1024, 1024) + (0, 0) + (1024, 1024))
+    micro_conds = torch.tensor([micro_conds]).repeat(batch_size, 1).to(device=device)
+    cond_embeds = torch.randn(batch_size, 512).to(dtype=dtype, device=device)
 
     def benchmark_fn():
-        transformer(image_tokens, encoder_hidden_states=encoder_hidden_states)
+        transformer(
+            image_tokens, encoder_hidden_states=encoder_hidden_states, micro_conds=micro_conds, cond_embeds=cond_embeds
+        )
 
     benchmark_fn()
 
@@ -274,7 +310,7 @@ def muse_benchmark_vae(in_queue, out_queue, timeout):
     wrap_subprocess_fn(in_queue, out_queue, timeout, _muse_benchmark_vae)
 
 
-def _muse_benchmark_vae(device, dtype, compiled, batch_size, model, label, description, timesteps):
+def _muse_benchmark_vae(device, dtype, compiled, batch_size, model, label, description, timesteps, resolution):
     vae_cls = model_config[model]["vae"]["cls"]
     vae = vae_cls.from_pretrained(model, subfolder="vae")
 
@@ -283,7 +319,9 @@ def _muse_benchmark_vae(device, dtype, compiled, batch_size, model, label, descr
     if compiled is not None:
         vae = torch.compile(vae, mode=compiled)
 
-    image_tokens = torch.full((batch_size, 256), fill_value=5, dtype=torch.long, device=device)
+    seq_len = (resolution // 16) ** 2
+
+    image_tokens = torch.full((batch_size, seq_len), fill_value=5, dtype=torch.long, device=device)
 
     def benchmark_fn():
         vae.decode_code(image_tokens)
@@ -343,10 +381,15 @@ def muse_benchmark_full(in_queue, out_queue, timeout):
     wrap_subprocess_fn(in_queue, out_queue, timeout, _muse_benchmark_full)
 
 
-def _muse_benchmark_full(device, dtype, compiled, batch_size, model, label, description, timesteps):
+def _muse_benchmark_full(device, dtype, compiled, batch_size, model, label, description, timesteps, resolution):
     tokenizer = AutoTokenizer.from_pretrained(model, subfolder="text_encoder")
 
-    text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder").to(device=device, dtype=dtype)
+    if "text_model_cls" in model_config[model]:
+        text_model_cls = model_config[model]["text_model_cls"]
+    else:
+        text_model_cls = CLIPTextModel
+
+    text_encoder = text_model_cls.from_pretrained(model, subfolder="text_encoder").to(device=device, dtype=dtype)
 
     vae_cls = model_config[model]["vae"]["cls"]
     vae = vae_cls.from_pretrained(model, subfolder="vae")
@@ -354,7 +397,7 @@ def _muse_benchmark_full(device, dtype, compiled, batch_size, model, label, desc
     vae = vae.to(device=device, dtype=dtype)
 
     transformer = MaskGiTUViT.from_pretrained(model, subfolder="transformer")
-
+    transformer.enable_xformers_memory_efficient_attention()
     transformer = transformer.to(device=device, dtype=dtype)
 
     if compiled is not None:
@@ -370,10 +413,12 @@ def _muse_benchmark_full(device, dtype, compiled, batch_size, model, label, desc
     pipe.device = device
     pipe.dtype = dtype
 
-    def benchmark_fn():
-        pipe(prompt, num_images_per_prompt=batch_size, timesteps=timesteps)
+    seq_len = (resolution // 16) ** 2
 
-    pipe(prompt, num_images_per_prompt=batch_size, timesteps=2)
+    def benchmark_fn():
+        pipe(prompt, num_images_per_prompt=batch_size, timesteps=timesteps, transformer_seq_len=seq_len)
+
+    pipe(prompt, num_images_per_prompt=batch_size, timesteps=2, transformer_seq_len=seq_len)
 
     def fn():
         return Timer(
@@ -394,7 +439,7 @@ def sd_benchmark_full(in_queue, out_queue, timeout):
     wrap_subprocess_fn(in_queue, out_queue, timeout, _sd_benchmark_full)
 
 
-def _sd_benchmark_full(device, dtype, compiled, batch_size, model, label, description, timesteps):
+def _sd_benchmark_full(device, dtype, compiled, batch_size, model, label, description, timesteps, resolution):
     tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer")
 
     text_encoder = CLIPTextModel.from_pretrained(model, subfolder="text_encoder").to(device=device, dtype=dtype)
@@ -421,9 +466,10 @@ def _sd_benchmark_full(device, dtype, compiled, batch_size, model, label, descri
     )
 
     def benchmark_fn():
-        pipe(prompt, num_images_per_prompt=batch_size, num_inference_steps=timesteps)
+        pipe(prompt, num_images_per_prompt=batch_size, num_inference_steps=timesteps, height=resolution, width=resolution)
 
-    pipe(prompt, num_images_per_prompt=batch_size, num_inference_steps=2)
+    pipe(prompt, num_images_per_prompt=batch_size, num_inference_steps=2, height=resolution, width=resolution)
+    pipe.enable_xformers_memory_efficient_attention()
 
     def fn():
         return Timer(
@@ -526,6 +572,20 @@ model_config = {
             "cls": PaellaVQModel,
         },
         "full": {"fn": muse_benchmark_full},
+    },
+    "williamberman/muse_research_run_benchmarking_512_output": {
+        "backbone": {
+            "fn": muse_benchmark_transformer_backbone,
+        },
+        "vae": {
+            "fn": muse_benchmark_vae,
+            "cls": VQGANModel,
+        },
+        "full": {
+            "fn": muse_benchmark_full,
+        },
+        "seq_len": 1024,
+        "text_model_cls": CLIPTextModelWithProjection,
     },
 }
 

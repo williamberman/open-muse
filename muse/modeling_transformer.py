@@ -1819,6 +1819,7 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
                 cond_embeds = torch.cat([cond_embeds, micro_cond_embeds], dim=1)
             else:
                 cond_embeds = micro_cond_embeds
+            cond_embeds = cond_embeds.to(dtype=self.dtype)
             cond_embeds = self.cond_embed(cond_embeds)
         elif self.config.add_cond_embeds:
             cond_embeds = self.cond_embed(cond_embeds)
@@ -1931,11 +1932,14 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
         guidance_schedule=None,
         noise_schedule: Callable = cosine_schedule,
         use_tqdm=True,
+        seq_len=None,
         **kwargs,
     ):
         # begin with all image token ids masked
         mask_token_id = self.config.mask_token_id
-        seq_len = self.config.num_vq_tokens
+
+        if seq_len is None:
+            seq_len = self.config.num_vq_tokens
 
         batch_size = len(class_ids) if class_ids is not None else encoder_hidden_states.shape[0]
         shape = (batch_size, seq_len)
@@ -2059,6 +2063,7 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
         predict_all_tokens=False,
         generator: torch.Generator = None,
         return_intermediate=False,
+        seq_len=None,
         **kwargs,
     ):
         """
@@ -2067,7 +2072,9 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
         """
         # begin with all image token ids masked
         mask_token_id = self.config.mask_token_id
-        seq_len = self.config.num_vq_tokens
+
+        if seq_len is None:
+            seq_len = self.config.num_vq_tokens
 
         batch_size = len(class_ids) if class_ids is not None else encoder_hidden_states.shape[0]
         shape = (batch_size, seq_len)
