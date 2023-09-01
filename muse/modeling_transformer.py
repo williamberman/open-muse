@@ -1579,6 +1579,8 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
             )
             cond_embed_dim = hidden_size
 
+        down_up_sample = True
+
         # Downsample
         DownBlock = DownsampleBlockVanilla if use_vannilla_resblock else DownsampleBlock
         output_channels = block_out_channels[0]
@@ -1588,11 +1590,6 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
             is_final_block = i == len(block_out_channels) - 1
             input_channels = output_channels
             output_channels = block_out_channels[i]
-
-            if use_vannilla_resblock:
-                add_downsample = not is_final_block
-            else:
-                add_downsample = not is_first_block
 
             self.down_blocks.append(
                 DownBlock(
@@ -1604,7 +1601,7 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
                     dropout=hidden_dropout if i == 0 else 0.0,
                     norm_type=norm_type,
                     ln_elementwise_affine=ln_elementwise_affine,
-                    add_downsample=add_downsample,
+                    add_downsample=down_up_sample,
                     add_cond_embeds=add_cond_embeds or add_micro_cond_embeds,
                     cond_embed_dim=cond_embed_dim,
                     has_attention=block_has_attention[i],
@@ -1684,7 +1681,7 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
                     dropout=hidden_dropout if i == 0 else 0.0,
                     norm_type=norm_type,
                     ln_elementwise_affine=ln_elementwise_affine,
-                    add_upsample=not is_final_block,
+                    add_upsample=down_up_sample,
                     add_cond_embeds=add_cond_embeds or add_micro_cond_embeds,
                     cond_embed_dim=cond_embed_dim,
                     has_attention=reversed_block_has_attention[i],
@@ -2098,7 +2095,9 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
             guidance_scales = torch.ones(timesteps) * guidance_scale
 
         if micro_conds is not None:
-            micro_conds = micro_conds.repeat(batch_size, 1).to(input_ids.device)
+            if micro_conds.shape[0] == 1:
+                micro_conds = micro_conds.repeat(batch_size, 1).to(input_ids.device)
+
             if guidance_scale > 0:
                 micro_conds = torch.cat([micro_conds, micro_conds], dim=0)
 
