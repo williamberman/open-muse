@@ -101,18 +101,18 @@ def muse_benchmark(resolution, batch_size, timesteps, use_xformers, use_fused_ml
     vae = VQGANModel.from_pretrained(model, subfolder="vae")
     vae.to(device=device, dtype=dtype)
 
+    kwargs = dict(**research_run_transformer_config)
+
     if use_fused_mlp:
-        ffn_type = "vanilla"
-    else:
-        ffn_type = "glu"
+        kwargs["ffn_type"] = "vanilla"
 
     transformer = MaskGiTUViT(
-        **research_run_transformer_config,
+        **kwargs,
         use_fused_mlp=use_fused_mlp,
         use_fused_residual_norm=use_fused_residual_norm,
-        ffn_type=ffn_type,
     )
     transformer = transformer.to(device=device, dtype=dtype)
+    transformer.eval()
 
     if use_xformers:
         transformer.enable_xformers_memory_efficient_attention()
@@ -138,7 +138,10 @@ def muse_benchmark(resolution, batch_size, timesteps, use_xformers, use_fused_ml
             stmt="benchmark_fn()",
             globals={"benchmark_fn": benchmark_fn},
             num_threads=num_threads,
-            label=f"batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}",
+            label=(
+                f"batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}, use_xformers: {use_xformers},"
+                f" use_fused_mlp: {use_fused_mlp}, use_fused_residual_norm: {use_fused_residual_norm}"
+            ),
             description=model,
         ).blocked_autorange(min_run_time=1)
 
@@ -237,7 +240,7 @@ research_run_transformer_config = {
     "micro_cond_encode_dim": 256,
     "norm_type": "rmsnorm",
     "num_attention_heads": 16,
-    "num_classes": null,
+    "num_classes": None,
     "num_hidden_layers": 22,
     "num_res_blocks": 3,
     "num_vq_tokens": 256,
