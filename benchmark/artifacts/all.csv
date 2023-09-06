@@ -1,4 +1,4 @@
-Batch Size,Model Name,Median,Device,Timesteps,Max Memory,Resolution,Use Xformers,Use Fused MLP, Use Fused Residual Norm
+Batch Size,Model Name,Median,Device,Timesteps,Max Memory,Resolution,Use Xformers,Use Fused MLP,Use Fused Residual Norm
 1,stable_diffusion_1_5,385.2332318201661,a100,12,2337289728,256,False,,
 1,muse,473.1298089027405,a100,12,1956756992,256,False,False,False
 1,muse,483.01582713611424,a100,12,1956756992,256,False,False,True
