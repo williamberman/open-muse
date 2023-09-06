@@ -16,6 +16,7 @@
 # This file is heavily inspired by the original implementation from https://github.com/lucidrains/muse-maskgit-pytorch
 
 import math
+import numbers
 from functools import partial
 from typing import Callable, Optional
 
@@ -69,32 +70,70 @@ def make_attention_mask(
     return (1.0 - mask).type(torch.bool)
 
 
-try:
-    from apex.normalization import FusedRMSNorm as RMSNorm  # noqa
-except Exception:
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps, elementwise_affine, use_fused_residual_norm=False):
+        super().__init__()
 
-    class RMSNorm(nn.Module):
-        def __init__(self, normalized_shape, eps=1e-6, elementwise_affine=True):
-            super().__init__()
-            self.elementwise_affine = elementwise_affine
-            if elementwise_affine:
-                self.weight = nn.Parameter(torch.ones(normalized_shape))
-            self.variance_epsilon = eps
+        if isinstance(dim, numbers.Integral):
+            dim = (dim,)
 
-        def forward(self, input):
-            input_dtype = input.dtype
-            variance = input.to(torch.float32).pow(2).mean(-1, keepdim=True)
-            input = input * torch.rsqrt(variance + self.variance_epsilon)
+        self.dim = torch.Size(dim)
 
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.weight = None
+
+        self.eps = eps
+        self.use_fused_residual_norm = use_fused_residual_norm
+        self.elementwise_affine = elementwise_affine
+
+    def forward(self, input, residual=None):
+        if self.use_fused_residual_norm:
+            from flash_attn.ops.rms_norm import dropout_add_rms_norm
+
+            return dropout_add_rms_norm(
+                input, residual, self.weight, None, dropout_p=0.0, epsilon=self.eps, prenorm=True
+            )
+
+        if residual is not None:
+            input = input + residual
+
+        prenorm_residual = input
+
+        try:
+            from apex.normalization.fused_layer_norm import (
+                fused_rms_norm,
+                fused_rms_norm_affine,
+            )
+
+            use_apex = True
+        except:
+            use_apex = False
+
+        if use_apex:
             if self.elementwise_affine:
-                # convert into half-precision if necessary
-                if self.weight.dtype in [torch.float16, torch.bfloat16]:
-                    input = input.to(self.weight.dtype)
-                input = input * self.weight
+                normed = fused_rms_norm_affine(input, self.weight, self.dim, self.eps)
             else:
-                input = input.to(input_dtype)
+                normed = fused_rms_norm(input, self.dim, self.eps)
+        else:
+            normed = self.unfused_rms_norm(input)
 
-            return input
+        return normed, prenorm_residual
+
+    def unfused_rms_norm(self, input):
+        input_dtype = input.dtype
+        variance = input.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        input = input * torch.rsqrt(variance + self.eps)
+
+        if self.elementwise_affine:
+            # convert into half-precision if necessary
+            if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                input = input.to(self.weight.dtype)
+            input = input * self.weight
+        else:
+            input = input.to(input_dtype)
+        return input
 
 
 def sinusoidal_enocde(features, embedding_dim, max_positions=10000):
@@ -119,7 +158,7 @@ def sinusoidal_enocde(features, embedding_dim, max_positions=10000):
 
 # layer norm without bias
 class LayerNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5, use_bias=False, elementwise_affine=True):
+    def __init__(self, dim, eps=1e-5, use_bias=False, elementwise_affine=True, use_fused_residual_norm=False):
         super().__init__()
         self.dim = dim
         if elementwise_affine:
@@ -129,9 +168,30 @@ class LayerNorm(nn.Module):
             self.weight = None
             self.bias = None
         self.eps = eps
+        self.use_fused_residual_norm = use_fused_residual_norm
 
-    def forward(self, x):
-        return F.layer_norm(x, (self.dim,), self.weight, self.bias, self.eps)
+    def forward(self, x, residual=None):
+        if self.use_fused_residual_norm:
+            from flash_attn.ops.layer_norm import dropout_add_layer_norm
+
+            return dropout_add_layer_norm(
+                x0=x,
+                residual=residual,
+                weight=self.weight,
+                bias=self.bias,
+                epsilon=self.eps,
+                dropout_p=0.0,
+                prenorm=True,
+            )
+
+        if residual is not None:
+            x = x + residual
+
+        prenorm_residual = x
+
+        x = F.layer_norm(x, (self.dim,), self.weight, self.bias, self.eps)
+
+        return x, prenorm_residual
 
 
 class AdaLNModulation(nn.Module):
@@ -253,14 +313,25 @@ class AttentionBlock2D(nn.Module):
         layer_norm_eps=1e-6,
         ln_elementwise_affine=True,
         use_bias=False,
+        use_fused_residual_norm=False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
 
         norm_cls = partial(LayerNorm, use_bias=use_bias) if norm_type == "layernorm" else RMSNorm
-        self.attn_layer_norm = norm_cls(self.hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine)
+        self.attn_layer_norm = norm_cls(
+            self.hidden_size,
+            eps=layer_norm_eps,
+            elementwise_affine=ln_elementwise_affine,
+            use_fused_residual_norm=use_fused_residual_norm,
+        )
         self.attention = Attention(hidden_size, num_heads, attention_dropout=attention_dropout, use_bias=use_bias)
-        self.crossattn_layer_norm = norm_cls(hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine)
+        self.crossattn_layer_norm = norm_cls(
+            hidden_size,
+            eps=layer_norm_eps,
+            elementwise_affine=ln_elementwise_affine,
+            use_fused_residual_norm=use_fused_residual_norm,
+        )
         self.crossattention = Attention(hidden_size, num_heads, attention_dropout=attention_dropout, use_bias=use_bias)
 
         if encoder_hidden_size != hidden_size:
@@ -279,14 +350,11 @@ class AttentionBlock2D(nn.Module):
             encoder_hidden_states = self.kv_mapper(F.silu(encoder_hidden_states))
 
         # self attention
-        residual = hidden_states
-        hidden_states = self.attn_layer_norm(hidden_states)
+        hidden_states, residual = self.attn_layer_norm(hidden_states)
         hidden_states = self.attention(hidden_states, encoder_hidden_states, encoder_attention_mask)
-        hidden_states = hidden_states + residual
 
         # cross attention
-        residual = hidden_states
-        hidden_states = self.crossattn_layer_norm(hidden_states)
+        hidden_states, residual = self.crossattn_layer_norm(hidden_states, residual)
         hidden_states = self.crossattention(hidden_states, encoder_hidden_states, encoder_attention_mask)
         hidden_states = hidden_states + residual
 
@@ -305,7 +373,10 @@ class Norm2D(nn.Module):
             self.norm = RMSNorm(dim, eps, elementwise_affine=elementwise_affine)
 
     def forward(self, x):
-        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = x.permute(0, 2, 3, 1)
+        x, _ = self.norm(x)
+        x = x.permute(0, 3, 1, 2)
+        return x
 
 
 class GlobalResponseNorm(nn.Module):
@@ -438,6 +509,7 @@ class DownsampleBlock(nn.Module):
         num_heads=None,
         encoder_hidden_size=None,
         use_bias=False,
+        use_fused_residual_norm=False,
         **kwargs,
     ):
         super().__init__()
@@ -487,6 +559,7 @@ class DownsampleBlock(nn.Module):
                         norm_type=norm_type,
                         ln_elementwise_affine=ln_elementwise_affine,
                         use_bias=use_bias,
+                        use_fused_residual_norm=use_fused_residual_norm,
                     )
                     for _ in range(num_res_blocks)
                 ]
@@ -541,6 +614,7 @@ class UpsampleBlock(nn.Module):
         num_heads=None,
         encoder_hidden_size=None,
         use_bias=False,
+        use_fused_residual_norm=False,
         **kwargs,
     ):
         super().__init__()
@@ -578,6 +652,7 @@ class UpsampleBlock(nn.Module):
                         norm_type=norm_type,
                         ln_elementwise_affine=ln_elementwise_affine,
                         use_bias=use_bias,
+                        use_fused_residual_norm=use_fused_residual_norm,
                     )
                     for _ in range(num_res_blocks)
                 ]
@@ -757,43 +832,113 @@ class FeedForward(nn.Module):
         cond_embed_dim=None,
         use_bias=False,
         ffn_type="glu",  # glu or vanilla
+        use_fused_residual_norm=False,
+        use_fused_mlp=False,
     ):
         super().__init__()
+
+        if use_fused_mlp:
+            assert use_normformer == False
+            assert ffn_type == "vanilla"
+            assert add_cond_embeds == False
+            assert cond_embed_dim is None
+            assert hidden_dropout == 0.0
+
+            self.activation = "gelu_approx"
+            self.heuristic = "auto"
+
+        self.use_fused_mlp = use_fused_mlp
+
         self.use_normformer = use_normformer
+
         self.ffn_type = ffn_type
+
         self.pre_mlp_layer_norm = LayerNorm(
-            hidden_size, eps=layer_norm_eps, use_bias=use_bias, elementwise_affine=ln_elementwise_affine
+            hidden_size,
+            eps=layer_norm_eps,
+            use_bias=use_bias,
+            elementwise_affine=ln_elementwise_affine,
+            use_fused_residual_norm=use_fused_residual_norm,
         )
+
         self.wi_0 = nn.Linear(hidden_size, intermediate_size, bias=use_bias)
+
         if ffn_type == "glu":
             self.wi_1 = nn.Linear(hidden_size, intermediate_size, bias=use_bias)
+
         if use_normformer:
             norm_cls = partial(LayerNorm, use_bias=use_bias) if norm_type == "layernorm" else RMSNorm
             self.mid_mlp_layer_norm = norm_cls(
                 intermediate_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine
             )
+
         self.wo = nn.Linear(intermediate_size, hidden_size, bias=use_bias)
+
         self.dropout = nn.Dropout(hidden_dropout)
+
         if add_cond_embeds:
             self.adaLN_modulation = AdaLNModulation(
                 cond_embed_dim=cond_embed_dim, hidden_size=hidden_size, use_bias=use_bias
             )
 
-    def forward(self, hidden_states: torch.FloatTensor, cond_embeds=None) -> torch.FloatTensor:
-        hidden_states = self.pre_mlp_layer_norm(hidden_states)
+    def forward(self, hidden_states: torch.FloatTensor, cond_embeds=None, residual=None) -> torch.FloatTensor:
+        hidden_states, residual = self.pre_mlp_layer_norm(hidden_states, residual=residual)
+
         if cond_embeds is not None:
             hidden_states = self.adaLN_modulation(hidden_states, cond_embeds)
+
+        if not self.use_fused_mlp:
+            hidden_states = self.unfused_mlp(hidden_states)
+        else:
+            hidden_states = self.fused_mlp(hidden_states)
+
+        return hidden_states, residual
+
+    def unfused_mlp(self, hidden_states):
         hidden_gelu = F.gelu(self.wi_0(hidden_states))
+
         if self.ffn_type == "glu":
             hidden_linear = self.wi_1(hidden_states)
             hidden_states = hidden_gelu * hidden_linear
         else:
             hidden_states = hidden_gelu
+
         if self.use_normformer:
             hidden_states = self.mid_mlp_layer_norm(hidden_states)
+
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.wo(hidden_states)
+
         return hidden_states
+
+    def fused_mlp(self, hidden_states):
+        from flash_attn.ops.fused_dense import fused_mlp_func
+
+        dtype = hidden_states.dtype if not torch.is_autocast_enabled() else torch.get_autocast_gpu_dtype()
+        if self.heuristic == "auto":
+            if self.activation == "gelu_approx":
+                if torch.cuda.get_device_capability("cuda") == (9, 0):
+                    heuristic = -1
+                else:
+                    cuda_ver = tuple(map(int, torch.version.cuda.split(".")))
+                    heuristic = 0 if cuda_ver >= (11, 8) else (1 if dtype == torch.float16 else -1)
+            else:
+                heuristic = 0
+        else:
+            heuristic = self.heuristic
+
+        hidden_states = fused_mlp_func(
+            hidden_states,
+            self.wi_0.weight,
+            self.wo.weight,
+            self.wi_0.bias,
+            self.wo.bias,
+            activation=self.activation,
+            save_pre_act=self.training,
+            return_residual=self.return_residual,
+            checkpoint_lvl=self.checkpoint_lvl,
+            heuristic=heuristic,
+        )
 
 
 # PreLN Transformer layer
@@ -815,6 +960,8 @@ class TransformerLayer(nn.Module):
         cond_embed_dim=None,
         ffn_type="glu",
         use_bias=False,
+        use_fused_residual_norm=False,
+        use_fused_mlp=False,
     ):
         super().__init__()
 
@@ -824,14 +971,23 @@ class TransformerLayer(nn.Module):
         self.use_normformer = use_normformer
 
         norm_cls = partial(LayerNorm, use_bias=use_bias) if norm_type == "layernorm" else RMSNorm
-        self.attn_layer_norm = norm_cls(self.hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine)
+
+        self.attn_layer_norm = norm_cls(
+            self.hidden_size,
+            eps=layer_norm_eps,
+            elementwise_affine=ln_elementwise_affine,
+            use_fused_residual_norm=use_fused_residual_norm,
+        )
+
         self.attention = Attention(
             self.hidden_size, self.num_attention_heads, attention_dropout=attention_dropout, use_bias=use_bias
         )
+
         if use_normformer:
             self.post_attn_layer_norm = norm_cls(
                 self.hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine
             )
+
         self.ffn = FeedForward(
             self.hidden_size,
             self.intermediate_size,
@@ -844,11 +1000,16 @@ class TransformerLayer(nn.Module):
             cond_embed_dim,
             use_bias,
             ffn_type,
+            use_fused_residual_norm=use_fused_residual_norm,
+            use_fused_mlp=use_fused_mlp,
         )
 
         if add_cross_attention:
             self.crossattn_layer_norm = norm_cls(
-                self.hidden_size, eps=layer_norm_eps, elementwise_affine=ln_elementwise_affine
+                self.hidden_size,
+                eps=layer_norm_eps,
+                elementwise_affine=ln_elementwise_affine,
+                use_fused_residual_norm=use_fused_residual_norm,
             )
             self.crossattention = Attention(
                 self.hidden_size, self.num_attention_heads, encoder_hidden_size, attention_dropout, use_bias
@@ -869,36 +1030,37 @@ class TransformerLayer(nn.Module):
                     use_bias=use_bias,
                 )
 
-    def forward(self, hidden_states, encoder_hidden_states=None, encoder_attention_mask=None, cond_embeds=None):
-        residual = hidden_states
+    def forward(
+        self, hidden_states, encoder_hidden_states=None, encoder_attention_mask=None, cond_embeds=None, residual=None
+    ):
+        hidden_states, residual = self.attn_layer_norm(hidden_states, residual=residual)
 
-        hidden_states = self.attn_layer_norm(hidden_states)
         if cond_embeds is not None:
             hidden_states = self.self_attn_adaLN_modulation(hidden_states, cond_embeds)
-        attention_output = self.attention(hidden_states)
+
+        hidden_states = self.attention(hidden_states)
+
         if self.use_normformer:
-            attention_output = self.post_attn_layer_norm(attention_output)
-        hidden_states = residual + attention_output
+            hidden_states, _ = self.post_attn_layer_norm(hidden_states)
 
         if encoder_hidden_states is not None:
-            residual = hidden_states
-            # TODO: should norm be applied to encoder_hidden_states as well?
-            hidden_states = self.crossattn_layer_norm(hidden_states)
+            hidden_states, residual = self.crossattn_layer_norm(hidden_states, residual=residual)
+
             if cond_embeds is not None:
                 hidden_states = self.cross_attn_adaLN_modulation(hidden_states, cond_embeds)
-            attention_output = self.crossattention(
+
+            hidden_states = self.crossattention(
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
             )
-            if self.use_normformer:
-                attention_output = self.post_crossattn_layer_norm(attention_output)
-            hidden_states = residual + attention_output
 
-        residual = hidden_states
-        hidden_states = self.ffn(hidden_states, cond_embeds=cond_embeds)
-        hidden_states = residual + hidden_states
-        return hidden_states
+            if self.use_normformer:
+                hidden_states = self.post_crossattn_layer_norm(hidden_states)
+
+        hidden_states, residual = self.ffn(hidden_states, cond_embeds=cond_embeds, residual=residual)
+
+        return hidden_states, residual
 
 
 class Embed(nn.Module):
@@ -1022,7 +1184,7 @@ class ConvEmbed(nn.Module):
         height, width = int(seq_length**0.5), int(seq_length**0.5)
         input_ids = input_ids.view(-1, height, width)
         embeddings = self.embeddings(input_ids)
-        embeddings = self.layer_norm(embeddings)
+        embeddings, _ = self.layer_norm(embeddings)
         embeddings = embeddings.permute(0, 3, 1, 2)
         if self.patch_size > 1:
             embeddings = self.pixel_unshuffle(embeddings)
@@ -1502,6 +1664,8 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
         ffn_type="glu",
         res_ffn_factor=4,
         force_down_up_sample=False,
+        use_fused_mlp=False,
+        use_fused_residual_norm=False,
         **kwargs,
     ):
         super().__init__()
@@ -1615,6 +1779,7 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
                     encoder_hidden_size=encoder_hidden_size,
                     use_bias=use_bias,
                     res_ffn_factor=res_ffn_factor,
+                    use_fused_residual_norm=use_fused_residual_norm,
                 )
             )
 
@@ -1643,6 +1808,8 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
                     cond_embed_dim=cond_embed_dim,
                     ffn_type=ffn_type,
                     use_bias=use_bias,
+                    use_fused_mlp=use_fused_mlp,
+                    use_fused_residual_norm=use_fused_residual_norm,
                 )
                 for _ in range(self.num_hidden_layers)
             ]
@@ -1700,6 +1867,7 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
                     encoder_hidden_size=encoder_hidden_size,
                     use_bias=use_bias,
                     res_ffn_factor=res_ffn_factor,
+                    use_fused_residual_norm=use_fused_residual_norm,
                 )
             )
 
@@ -1810,7 +1978,7 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
 
         if encoder_hidden_states is not None and self.config.project_encoder_hidden_states:
             encoder_hidden_states = self.encoder_proj(encoder_hidden_states)
-            encoder_hidden_states = self.encoder_proj_layer_norm(encoder_hidden_states)
+            encoder_hidden_states, _ = self.encoder_proj_layer_norm(encoder_hidden_states)
 
         if self.config.add_micro_cond_embeds:
             micro_cond_embeds = sinusoidal_enocde(micro_conds.flatten(), self.config.micro_cond_encode_dim)
@@ -1840,8 +2008,10 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
         hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(batch_size, height * width, channels)
 
         if self.use_projection:
-            hidden_states = self.project_to_hidden_norm(hidden_states)
+            hidden_states, _ = self.project_to_hidden_norm(hidden_states)
             hidden_states = self.project_to_hidden(hidden_states)
+
+        transformer_residual = None
 
         for layer in self.transformer_layers:
             if self.gradient_checkpointing:
@@ -1852,26 +2022,30 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
 
                     return custom_forward
 
-                hidden_states = checkpoint(
+                hidden_states, transformer_residual = checkpoint(
                     create_custom_forward(layer),
                     hidden_states,
                     encoder_hidden_states,
                     encoder_attention_mask,
                     cond_embeds,
+                    transformer_residual,
                 )
             else:
-                hidden_states = layer(
+                hidden_states, transformer_residual = layer(
                     hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     cond_embeds=cond_embeds,
+                    residual=transformer_residual,
                 )
+
+        hidden_states = hidden_states + transformer_residual
 
         if self.config.use_encoder_layernorm:
             hidden_states = self.encoder_layer_norm(hidden_states)
 
         if self.use_projection:
-            hidden_states = self.project_from_hidden_norm(hidden_states)
+            hidden_states, _ = self.project_from_hidden_norm(hidden_states)
             hidden_states = self.project_from_hidden(hidden_states)
 
         hidden_states = hidden_states.reshape(batch_size, height, width, channels).permute(0, 3, 1, 2)
@@ -1910,6 +2084,7 @@ class MaskGiTUViT(ModelMixin, ConfigMixin):
                 loss_weight = loss_weight.view(-1)
                 loss = ((loss * loss_weight).sum(dim=-1) / loss_weight.sum(dim=-1)).mean()
             return logits, loss
+
         return logits
 
     def _set_gradient_checkpointing(self, module, value=False):
