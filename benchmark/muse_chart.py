@@ -3,14 +3,6 @@ from argparse import ArgumentParser
 import matplotlib.pyplot as plt
 import pandas as pd
 
-df = pd.read_csv("benchmark/artifacts/all.csv")
-
-# round to GB
-df["Max Memory"] = df["Max Memory"].apply(lambda x: round(x / 10**9, 2))
-
-df["Median"] = df["Median"].apply(lambda x: round(x/1000, 2))
-df["Mean"] = df["Mean"].apply(lambda x: round(x/1000, 2))
-
 bar_width = 0.10
 
 model_names = [
@@ -19,8 +11,8 @@ model_names = [
 ]
 
 
-def chart(device, component, resolution, plot_on, legend, y_axis_key, y_label, timesteps):
-    filter = (df["Device"] == device) & (df["Component"] == component) & (df["Resolution"] == resolution)
+def chart(df, device, resolution, plot_on, legend, y_axis_key, y_label, timesteps):
+    filter = (df["Device"] == device) & (df["Resolution"] == resolution)
 
     if timesteps is not None:
         filter = filter & (df["Timesteps"] == timesteps)
@@ -54,7 +46,7 @@ def chart(device, component, resolution, plot_on, legend, y_axis_key, y_label, t
                 ha="center",
                 va="bottom",
                 rotation=80,
-                fontsize="small"
+                fontsize="small",
             )
 
         inc_placement()
@@ -69,26 +61,17 @@ def chart(device, component, resolution, plot_on, legend, y_axis_key, y_label, t
 
 
 """
-python muse_chart.py --component full --graphing time --timesteps 12
-python muse_chart.py --component full --graphing time --timesteps 20
-python muse_chart.py --component full --graphing memory --timesteps 12
-python muse_chart.py --component full --graphing memory --timesteps 20
-
-python muse_chart.py --component backbone --graphing time
-python muse_chart.py --component backbone --graphing memory
-
-python muse_chart.py --component vae --graphing time
-python muse_chart.py --component vae --graphing memory
+python benchmark/muse_chart.py --component full --graphing time --timesteps 12
+python benchmark/muse_chart.py --component full --graphing time --timesteps 20
+python benchmark/muse_chart.py --component full --graphing memory --timesteps 12
+python benchmark/muse_chart.py --component full --graphing memory --timesteps 20
 """
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--component", required=True)
     parser.add_argument("--graphing", required=True)
     parser.add_argument("--timesteps", required=False, default=None)
 
     args = parser.parse_args()
-
-    assert args.component in ["full", "backbone", "vae"]
 
     if args.graphing == "time":
         y_axis_key = "Median"
@@ -101,17 +84,23 @@ if __name__ == "__main__":
 
     fig, axs = plt.subplots(4, 2, sharey="row")
 
+    df = pd.read_csv("benchmark/artifacts/all.csv")
+
+    # round to GB
+    df["Max Memory"] = df["Max Memory"].apply(lambda x: round(x / 10**9, 2))
+
+    df["Median"] = df["Median"].apply(lambda x: round(x / 1000, 2))
+
     for row_idx_1, device in enumerate(["a100", "4090"]):
         for row_idx_2, timesteps in enumerate([12, 20]):
-
             row_idx = row_idx_1 * 2 + row_idx_2
 
             for col_idx, resolution in enumerate([256, 512]):
                 legend = row_idx == 0 and col_idx == 1
 
                 chart(
+                    df,
                     device,
-                    args.component,
                     resolution,
                     axs[row_idx, col_idx],
                     legend,
