@@ -139,8 +139,9 @@ def muse_benchmark(resolution, batch_size, timesteps, use_xformers, use_fused_ml
             globals={"benchmark_fn": benchmark_fn},
             num_threads=num_threads,
             label=(
-                f"batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}, use_xformers: {use_xformers},"
-                f" use_fused_mlp: {use_fused_mlp}, use_fused_residual_norm: {use_fused_residual_norm}"
+                f"batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}, resolution: {resolution},"
+                f" use_xformers: {use_xformers}, use_fused_mlp: {use_fused_mlp}, use_fused_residual_norm:"
+                f" {use_fused_residual_norm}"
             ),
             description=model,
         ).blocked_autorange(min_run_time=1)
@@ -191,7 +192,10 @@ def sd_benchmark(resolution, batch_size, timesteps, use_xformers):
             stmt="benchmark_fn()",
             globals={"benchmark_fn": benchmark_fn},
             num_threads=num_threads,
-            label=f"batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}",
+            label=(
+                f"batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}, resolution: {resolution},"
+                f" use_xformers: {use_xformers}"
+            ),
             description=model,
         ).blocked_autorange(min_run_time=1)
 
