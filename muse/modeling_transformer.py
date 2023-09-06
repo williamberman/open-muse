@@ -840,8 +840,6 @@ class FeedForward(nn.Module):
         if use_fused_mlp:
             assert use_normformer == False
             assert ffn_type == "vanilla"
-            assert add_cond_embeds == False
-            assert cond_embed_dim is None
             assert hidden_dropout == 0.0
 
             self.activation = "gelu_approx"
@@ -935,10 +933,12 @@ class FeedForward(nn.Module):
             self.wo.bias,
             activation=self.activation,
             save_pre_act=self.training,
-            return_residual=self.return_residual,
-            checkpoint_lvl=self.checkpoint_lvl,
+            return_residual=False,
+            checkpoint_lvl=0,
             heuristic=heuristic,
         )
+
+        return hidden_states
 
 
 # PreLN Transformer layer
