@@ -42,7 +42,7 @@ def main():
                     csv_data.append(
                         [
                             batch_size,
-                            "muse",
+                            "stable_diffusion_1_5",
                             out.median * 1000,
                             args.device,
                             timesteps,
@@ -71,7 +71,7 @@ def main():
                             csv_data.append(
                                 [
                                     batch_size,
-                                    "stable_diffusion_1_5",
+                                    "muse",
                                     out.median * 1000,
                                     args.device,
                                     timesteps,
