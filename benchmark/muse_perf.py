@@ -101,8 +101,16 @@ def muse_benchmark(resolution, batch_size, timesteps, use_xformers, use_fused_ml
     vae = VQGANModel.from_pretrained(model, subfolder="vae")
     vae.to(device=device, dtype=dtype)
 
+    if use_fused_mlp:
+        ffn_type = "vanilla"
+    else:
+        ffn_type = "glu"
+
     transformer = MaskGiTUViT(
-        **research_run_transformer_config, use_fused_mlp=use_fused_mlp, use_fused_residual_norm=use_fused_residual_norm
+        **research_run_transformer_config,
+        use_fused_mlp=use_fused_mlp,
+        use_fused_residual_norm=use_fused_residual_norm,
+        ffn_type=ffn_type,
     )
     transformer = transformer.to(device=device, dtype=dtype)
 
