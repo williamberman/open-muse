@@ -1,4 +1,5 @@
 import csv
+import dataclasses
 from argparse import ArgumentParser
 
 import torch
@@ -11,7 +12,8 @@ from transformers import (
     CLIPTokenizer,
 )
 
-from muse import MaskGiTUViT, PipelineMuse, VQGANModel
+from muse import PipelineMuse, VQGANModel
+from muse.modeling_transformer_v2 import MaskGiTUViT_v2, MaskGiTUViT_v2Config
 
 torch.manual_seed(0)
 torch.set_grad_enabled(False)
@@ -51,44 +53,50 @@ def main():
                             use_xformers,
                             None,
                             None,
+                            None,
                         ]
                     )
 
-                    for use_fused_mlp in [False, True]:
-                        for use_fused_residual_norm in [False, True]:
-                            out, mem_bytes = muse_benchmark(
-                                resolution=resolution,
-                                batch_size=batch_size,
-                                timesteps=timesteps,
-                                use_xformers=use_xformers,
-                                use_fused_mlp=use_fused_mlp,
-                                use_fused_residual_norm=use_fused_residual_norm,
-                            )
+                    for force_down_up_sample in [False, True]:
+                        for use_fused_mlp in [False, True]:
+                            for use_fused_residual_norm in [False, True]:
+                                out, mem_bytes = muse_benchmark(
+                                    resolution=resolution,
+                                    batch_size=batch_size,
+                                    timesteps=timesteps,
+                                    use_xformers=use_xformers,
+                                    force_down_up_sample=force_down_up_sample,
+                                    use_fused_mlp=use_fused_mlp,
+                                    use_fused_residual_norm=use_fused_residual_norm,
+                                )
 
-                            Compare([out]).print()
-                            print("*******")
+                                Compare([out]).print()
+                                print("*******")
 
-                            csv_data.append(
-                                [
-                                    batch_size,
-                                    "muse",
-                                    out.median * 1000,
-                                    args.device,
-                                    timesteps,
-                                    mem_bytes,
-                                    resolution,
-                                    use_xformers,
-                                    use_fused_mlp,
-                                    use_fused_residual_norm,
-                                ]
-                            )
+                                csv_data.append(
+                                    [
+                                        batch_size,
+                                        "muse",
+                                        out.median * 1000,
+                                        args.device,
+                                        timesteps,
+                                        mem_bytes,
+                                        resolution,
+                                        use_xformers,
+                                        force_down_up_sample,
+                                        use_fused_mlp,
+                                        use_fused_residual_norm,
+                                    ]
+                                )
 
     with open("benchmark/artifacts/all.csv", "a", newline="") as csvfile:
         writer = csv.writer(csvfile)
         writer.writerows(csv_data)
 
 
-def muse_benchmark(resolution, batch_size, timesteps, use_xformers, use_fused_mlp, use_fused_residual_norm):
+def muse_benchmark(
+    resolution, batch_size, timesteps, use_xformers, force_down_up_sample, use_fused_mlp, use_fused_residual_norm
+):
     model = "williamberman/muse_research_run_benchmarking_512_output"
     device = "cuda"
     dtype = torch.float16
@@ -101,16 +109,14 @@ def muse_benchmark(resolution, batch_size, timesteps, use_xformers, use_fused_ml
     vae = VQGANModel.from_pretrained(model, subfolder="vae")
     vae.to(device=device, dtype=dtype)
 
-    kwargs = dict(**research_run_transformer_config)
-
-    if use_fused_mlp:
-        kwargs["ffn_type"] = "vanilla"
-
-    transformer = MaskGiTUViT(
-        **kwargs,
+    transformer_config = MaskGiTUViT_v2Config(
         use_fused_mlp=use_fused_mlp,
         use_fused_residual_norm=use_fused_residual_norm,
+        force_down_up_sample=force_down_up_sample,
     )
+    transformer_config = dataclasses.asdict(transformer_config)
+
+    transformer = MaskGiTUViT_v2(**transformer_config)
     transformer = transformer.to(device=device, dtype=dtype)
     transformer.eval()
 
@@ -141,7 +147,7 @@ def muse_benchmark(resolution, batch_size, timesteps, use_xformers, use_fused_ml
             label=(
                 f"batch_size: {batch_size}, dtype: {dtype}, timesteps {timesteps}, resolution: {resolution},"
                 f" use_xformers: {use_xformers}, use_fused_mlp: {use_fused_mlp}, use_fused_residual_norm:"
-                f" {use_fused_residual_norm}"
+                f" {use_fused_residual_norm}, force_down_up_sample: {force_down_up_sample}"
             ),
             description=model,
         ).blocked_autorange(min_run_time=1)
@@ -213,54 +219,6 @@ def measure_max_memory_allocated(fn):
 
     return rv, mem_bytes
 
-
-research_run_transformer_config = {
-    "_class_name": "MaskGiTUViT",
-    "_version": "0.0.1",
-    "add_cond_embeds": True,
-    "add_cross_attention": True,
-    "add_micro_cond_embeds": True,
-    "attention_dropout": 0.0,
-    "block_has_attention": [True],
-    "block_num_heads": [12],
-    "block_out_channels": [768],
-    "codebook_size": 8192,
-    "cond_embed_dim": 768,
-    "encoder_hidden_size": 768,
-    "ffn_type": "glu",
-    "hidden_dropout": 0.0,
-    "hidden_size": 1024,
-    "in_channels": 768,
-    "initializer_range": 0.02,
-    "intermediate_size": 2816,
-    "layer_norm_before_mlm": False,
-    "layer_norm_embedddings": False,
-    "layer_norm_eps": 0.000001,
-    "learn_uncond_embeds": False,
-    "ln_elementwise_affine": True,
-    "mask_token_id": 8255,
-    "max_position_embeddings": 256,
-    "micro_cond_embed_dim": 1280,
-    "micro_cond_encode_dim": 256,
-    "norm_type": "rmsnorm",
-    "num_attention_heads": 16,
-    "num_classes": None,
-    "num_hidden_layers": 22,
-    "num_res_blocks": 3,
-    "num_vq_tokens": 256,
-    "patch_size": 1,
-    "project_encoder_hidden_states": True,
-    "res_ffn_factor": 4,
-    "use_bias": False,
-    "use_codebook_size_for_output": True,
-    "use_empty_embeds_for_uncond": True,
-    "use_encoder_layernorm": False,
-    "use_normformer": False,
-    "use_position_embeddings": False,
-    "use_vannilla_resblock": False,
-    "vocab_size": 8256,
-    "xavier_init_embed": True,
-}
 
 if __name__ == "__main__":
     main()

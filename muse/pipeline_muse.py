@@ -83,7 +83,7 @@ class PipelineMuse:
         aesthetic_score=6.0,
         return_intermediate: bool = False,
         use_tqdm=True,
-        transformer_seq_len=None,
+        transformer_seq_len=256,
     ):
         if text is None and class_ids is None:
             raise ValueError("Either text or class_ids must be provided.")

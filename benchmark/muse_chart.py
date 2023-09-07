@@ -3,64 +3,63 @@ from argparse import ArgumentParser
 import matplotlib.pyplot as plt
 import pandas as pd
 
+"""
+python benchmark/muse_chart.py --device a100
+python benchmark/muse_chart.py --device 4090
+"""
+
 bar_width = 0.10
 
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--graphing", required=True)
+    parser.add_argument("--device", choices=["4090", "a100"], required=True)
 
     args = parser.parse_args()
 
-    if args.graphing == "time":
-        y_axis_key = "Median"
-        y_label = "Median Time (s)"
-    elif args.graphing == "memory":
-        y_axis_key = "Max Memory"
-        y_label = "Max Memory (GB)"
-    else:
-        assert False, args.graphing
+    y_axis_key = "Median"
+    y_label = "Median Time (s)"
 
     df = pd.read_csv("benchmark/artifacts/all.csv")
 
-    # round to GB
-    df["Max Memory"] = df["Max Memory"].apply(lambda x: round(x / 10**9, 2))
-
     df["Median"] = df["Median"].apply(lambda x: round(x / 1000, 2))
 
-    devices = df["Device"].unique()
     timesteps = [12, 20]
     resolutions = [256, 512]
+    force_down_up_samples = [False, True]
 
-    num_rows = len(devices) * len(timesteps)
+    num_rows = len(timesteps) * len(force_down_up_samples)
     num_cols = len(resolutions)
 
     fig, axs = plt.subplots(num_rows, num_cols, sharey="row")
 
-    for row_idx_1, device in enumerate(devices):
-        for row_idx_2, timesteps in enumerate(timesteps):
-            row_idx = row_idx_1 * len(devices) + row_idx_2
+    for row_idx_1, timesteps_ in enumerate(timesteps):
+        for row_idx_2, force_down_up_sample in enumerate(force_down_up_samples):
+            row_idx = row_idx_1 * len(timesteps) + row_idx_2
 
             for col_idx, resolution in enumerate(resolutions):
-                legend = row_idx == 0 and col_idx == 1
+                plot_on = axs[row_idx, col_idx]
 
                 chart(
                     df=df,
-                    device=device,
+                    device=args.device,
                     resolution=resolution,
-                    plot_on=axs[row_idx, col_idx],
-                    legend=legend,
+                    force_down_up_sample=force_down_up_sample,
+                    plot_on=plot_on,
                     y_axis_key=y_axis_key,
                     y_label=y_label,
-                    timesteps=timesteps,
+                    timesteps=timesteps_,
                 )
+
+                if row_idx == 3 and col_idx == 1:
+                    plot_on.legend(bbox_to_anchor=(1, -0.1), fontsize="x-small")
 
     plt.subplots_adjust(hspace=0.75, wspace=0.50)
 
     plt.show()
 
 
-def chart(df, device, resolution, plot_on, legend, y_axis_key, y_label, timesteps):
+def chart(df, device, resolution, force_down_up_sample, plot_on, y_axis_key, y_label, timesteps):
     filter = (df["Device"] == device) & (df["Resolution"] == resolution)
 
     if timesteps is not None:
@@ -100,6 +99,7 @@ def chart(df, device, resolution, plot_on, legend, y_axis_key, y_label, timestep
             & (fdf["Use Xformers"] == use_xformers)
             & (fdf["Use Fused MLP"] == use_fused_mlp)
             & (fdf["Use Fused Residual Norm"] == use_fused_residual_norm)
+            & (df["Force Down Up Sample"] == force_down_up_sample)
         )
 
         plot_one_bar(
@@ -119,10 +119,9 @@ def chart(df, device, resolution, plot_on, legend, y_axis_key, y_label, timestep
     plot_on.set_xlabel("Batch Size")
     plot_on.set_ylabel(y_label)
     plot_on.set_xticks([r + bar_width for r in range(2)], [1, 8])
-    plot_on.set_title(f"{device}, timesteps: {timesteps}, resolution: {resolution}")
-
-    if legend:
-        plot_on.legend(fontsize="x-small")
+    plot_on.set_title(
+        f"{device}, timesteps: {timesteps}, resolution: {resolution} muse downsampled {force_down_up_sample}"
+    )
 
 
 def plot_one_bar(fdf, filter_, plot_on, placement, label, y_axis_key):
@@ -148,11 +147,5 @@ def plot_one_bar(fdf, filter_, plot_on, placement, label, y_axis_key):
         )
 
 
-"""
-python benchmark/muse_chart.py --graphing time
-python benchmark/muse_chart.py --graphing time
-python benchmark/muse_chart.py --graphing memory
-python benchmark/muse_chart.py --graphing memory
-"""
 if __name__ == "__main__":
     main()
