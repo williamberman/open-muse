@@ -15,15 +15,16 @@ logger = logging.getLogger(__name__)
 def main():
     args = argparse.ArgumentParser()
     args.add_argument("--slurm", action="store_true")
+    args.add_argument("--parquet_n", required=True, type=int)
     args = args.parse_args()
 
     # download parquet from https://huggingface.co/datasets/ptx0/mj-general/tree/main
 
-    data = pd.read_parquet("/fsx/william/tmp/mj-general-0002.parquet")
+    data = pd.read_parquet(f"/fsx/william/tmp/mj-general-000{args.parquet_n}.parquet")
 
-    write_to = "pipe:aws s3 cp - s3://muse-datasets/mj-general/0002"
+    write_to = f"pipe:aws s3 cp - s3://muse-datasets/mj-general/000{args.parquet_n}"
 
-    checkpoint_dir = "/fsx/william/tmp/download_mj_general_0002"
+    checkpoint_dir = f"/fsx/william/tmp/download_mj_general_000{args.parquet_n}"
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
