@@ -8,6 +8,7 @@ import pandas as pd
 import torch
 import webdataset as wds
 from torch.utils.data import DataLoader, Dataset
+from diffusers import DiffusionPipeline
 
 try:
     from cleanfid import fid
@@ -62,9 +63,9 @@ def generate_and_save_images_flickr_8k(args):
             text,
             timesteps=args.timesteps,
             guidance_scale=args.guidance_scale,
-            temperature=args.temperature,
             generator=generator,
             use_tqdm=False,
+            transformer_seq_len=1024,
         )
 
         for image_name, image in zip(image_names, images):
@@ -109,15 +110,22 @@ def generate_and_save_images_coco(args):
     os.makedirs(args.dataset_root, exist_ok=True)
 
     logger.warning("Loading pipe")
-    pipeline = PipelineMuse.from_pretrained(args.model_name_or_path).to(args.device)
-    pipeline.transformer.enable_xformers_memory_efficient_attention()
+    if args.model == "muse":
+        pipeline = PipelineMuse.from_pretrained(args.model_name_or_path).to(args.device)
+        pipeline.transformer.enable_xformers_memory_efficient_attention()
+    elif args.model == "sd15":
+        pipeline = DiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16, variant="fp16", safety_checker=None).to(args.device)
+        pipeline.enable_xformers_memory_efficient_attention()
+        pipeline.set_progress_bar_config(disable=True)
+    else:
+        assert False
 
     logger.warning("Loading data")
 
-    # 20 shards is safe range to get 30k images
-    start_shard = 0
-    end_shard = 20
-    num_images_to_generate = 30_000
+    start_shard = args.start_shard
+    end_shard = args.end_shard
+    num_images_to_generate = args.num_images_to_generate
+    num_images_previously_generated = args.num_images_previously_generated
 
     if args.slurm:
         slurm_ntasks = int(os.environ["SLURM_NTASKS"])
@@ -127,6 +135,7 @@ def generate_and_save_images_coco(args):
 
         start_shard, end_shard = distributed_shards[slurm_procid]
         num_images_to_generate = round(num_images_to_generate / slurm_ntasks)
+        num_images_previously_generated = round(num_images_previously_generated / slurm_ntasks)
 
         logger.warning("************")
         logger.warning("Running as slurm task")
@@ -142,7 +151,7 @@ def generate_and_save_images_coco(args):
         logger.warning("************")
 
     shard_range = "{" + format_shard_number(start_shard) + ".." + format_shard_number(end_shard) + "}"
-    download_shards = f"pipe:aws s3 cp s3://muse-datasets/coco/2017/train/{shard_range}.tar -"
+    download_shards = f"pipe:aws s3 cp s3://muse-datasets/coco/2014/val/{shard_range}.tar -"
 
     logger.warning(f"downloading shards {download_shards}")
 
@@ -177,18 +186,30 @@ def generate_and_save_images_coco(args):
         logger.warning(f"Creating {len(__key__)} images: {__key__[0]} {__key__[-1]}")
         num_images_generated += len(__key__)
 
+        if num_images_generated < num_images_previously_generated:
+            continue
+
         text = [json.loads(x["annotations"])[0]["caption"] for x in metadata]
 
         t0 = time.perf_counter()
 
-        generated_image = pipeline(
-            text,
-            timesteps=args.timesteps,
-            guidance_scale=args.guidance_scale,
-            temperature=args.temperature,
-            generator=generator,
-            use_tqdm=False,
-        )
+        if args.model == "muse":
+            generated_image = pipeline(
+                text,
+                timesteps=args.timesteps,
+                guidance_scale=args.guidance_scale,
+                generator=generator,
+                use_tqdm=False,
+                transformer_seq_len=1024,
+            )
+        elif args.model == "sd15":
+            generated_image = pipeline(
+                text,
+                generator=generator,
+                guidance_scale=args.guidance_scale,
+            ).images
+        else:
+            assert False
 
         logger.warning(f"Generation time {time.perf_counter() - t0}")
 
@@ -216,8 +237,8 @@ def main(args):
         real_images = args.dataset_root
         generated_images = args.save_path
         logger.warning("computing FiD")
-        score_clean = fid.compute_fid(real_images, generated_images, mode="clean", num_workers=0)
-        logger.warning(f"clean-fid score is {score_clean:.3f}")
+        score_clean = fid.compute_fid(real_images, generated_images, mode="clean", num_workers=args.num_workers)
+        logger.warning(f"clean-fid score {args.save_path} is {score_clean:.3f}")
 
 
 if __name__ == "__main__":
@@ -234,11 +255,18 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=2028)
     parser.add_argument("--dataset", type=str, default="flickr_8k", choices=("flickr_8k", "coco"))
     parser.add_argument("--do", type=str, default="full", choices=("full", "generate_and_save_images", "compute_fid"))
+    parser.add_argument("--num_images_to_generate", type=int, default=30_000)
+    parser.add_argument("--num_images_previously_generated", type=int, default=0)
+    # 20 shards is safe range to get 30k images. 
+    parser.add_argument("--start_shard", type=int, default=0)
+    parser.add_argument("--end_shard", type=int, default=20)
+    parser.add_argument("--model", choices=["muse", "sd15"], required=False)
     parser.add_argument(
         "--slurm",
         action="store_true",
         help="Set when running as a slurm job to distribute coco image generation among multiple GPUs",
     )
+    parser.add_argument("--num_workers", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -246,8 +274,11 @@ if __name__ == "__main__":
         if args.dataset == "flickr_8k" and args.dataset_captions_file is None:
             raise ValueError("`--dataset=flickr_8k` requires setting `--dataset_captions_file`")
 
-        if args.model_name_or_path is None:
+        if args.model_name_or_path is None and args.model == "muse":
             raise ValueError("`--do=full|generate_and_save_images` requires setting `--model_name_or_path`")
+
+        if args.model is None:
+            raise ValueError("--do=full|generate_and_save_images` requires setting `--model`")
 
     if args.do == "full":
         logger.warning("generating images and calculating fid")
